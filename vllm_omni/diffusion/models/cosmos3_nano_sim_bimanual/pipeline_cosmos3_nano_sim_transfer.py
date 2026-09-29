@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline dense-oracle pipeline for Cosmos3-Nano-Sim-Transfer."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Offline Cosmos3-Nano-Sim-Transfer with dense or paired paged history."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 from typing import Any, ClassVar
 
@@ -39,6 +40,9 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
 )
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.paged_attention_transfer import (
+    CosmosSimTransferPagedAttention,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualPipeline,
     _admission_float,
@@ -50,11 +54,20 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualSessionState,
 )
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
+    Cosmos3NanoSimBimanualTransformerOutput,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_transfer import (
     Cosmos3NanoSimTransferTransformer,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import iter_clean_commit_frames
-from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
+from vllm_omni.experimental.ar_diffusion.capability import (
+    ARDiffusionCrossAttentionKVSpec,
+    ARDiffusionKVBranchSpec,
+    ARDiffusionKVCacheSpec,
+    ARDiffusionRequestKVSpec,
+    ARDiffusionRequestRejectedError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +375,13 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
                 f"{type(self.transformer).__name__}."
             )
 
+    def _prepare_paged_attention(self, paged_kv, *, text_kv, real_text_kv_len):
+        paged_state = self._ar_diffusion_kv_state
+        owner = getattr(self, "_transfer_paged_attention", None)
+        if owner is None or not owner.is_bound_to(paged_state.kv_cache):
+            owner = self._transfer_paged_attention = CosmosSimTransferPagedAttention(paged_state.kv_cache)
+        return owner.wrap(paged_kv, session_id=paged_state.session_id, text_kv=text_kv, text_length=real_text_kv_len)
+
     def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
         contract = self.manifest.require_control_video_conditioning()
         if self.manifest.chunk_size != 1 and (self.manifest.sink_frames != 0 or not contract.no_eviction):
@@ -398,10 +418,257 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             raise ValueError(f"Cosmos3-Nano-Sim-Transfer checkpoint contains forbidden action weights: {preview}.")
         return loaded
 
-    def ar_diffusion_kv_cache_spec(self):
-        raise NotImplementedError(
-            "Cosmos3-Nano-Sim-Transfer paged-cache topology is Phase T2; use the default dense diffusion engine."
+    def _kv_spec_for_geometry(
+        self,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        *,
+        window_frames: int | None = None,
+        sink_frames: int | None = None,
+        text_capacity: int | None = None,
+    ) -> ARDiffusionKVCacheSpec:
+        chunk_size = self.manifest.chunk_size
+        window = self.manifest.window_frames if window_frames is None else window_frames
+        sinks = self.manifest.sink_frames if sink_frames is None else sink_frames
+        text = self.manifest.text_cache_max_len if text_capacity is None else text_capacity
+        if not 0 <= sinks < window:
+            raise ValueError("Require kv_cache_inference_size > attention_sink_size >= 0.")
+        paired_sliding = chunk_size == 1
+        if not paired_sliding and (sinks or not self.manifest.require_control_video_conditioning().no_eviction):
+            raise ValueError("Chunkwise Transfer requires the checkpoint's full-history contract.")
+        # W includes sinks and the current temporal frame. Before C_t retain
+        # W-1 complete pairs; after C_t retain one extra block. An odd tail
+        # capacity and two-block eviction publish G_t before evicting a pair.
+        # This is equivalent to dense trimming immediately before the next C.
+        return ARDiffusionKVCacheSpec(
+            num_layers=self.transformer.num_hidden_layers,
+            num_kv_heads=self.transformer.num_kv_heads_local,
+            head_size=self.transformer.head_dim,
+            tokens_per_frame=geometry.vision_tokens_per_frame,
+            frames_per_block=chunk_size,
+            # Chunkwise checkpoints commit [C_t ... C_t+n], then individual
+            # clean latent frames. Admission guarantees that
+            # the whole rollout fits this capacity, so there is no eviction.
+            window_frames=2 * (window - sinks) - 1 if paired_sliding else window,
+            sink_frames=2 * sinks if paired_sliding else 0,
+            eviction_group_frames=2 if paired_sliding else 1,
+            kv_branches=(ARDiffusionKVBranchSpec(self._MAIN_BRANCH, 0),),
+            session_capacity=self._SESSION_CAPACITY,
+            cross_attention=(ARDiffusionCrossAttentionKVSpec("text", text),),
+            max_scratch_frames_per_branch=chunk_size,
+            max_scratch_tokens_per_branch=text,
         )
+
+    def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionRequestKVSpec:
+        # Runner admission receives OmniDiffusionRequest; pipeline admission
+        # receives its single-prompt DiffusionRequestBatch representation.
+        prompt = request.prompt if hasattr(request, "prompt") else request.prompts[0]
+        sp = request.sampling_params
+        if self._get_sp_param(sp, "ar_diffusion_tick", None) is not None:
+            self._parse_tick(None)
+        contract = self._validate_conditioning_request(sp, None, prompt_data=prompt)
+        geometry = self._resolve_request_geometry(sp, prompt)
+        text_capacity = self._prompt_token_limit(sp, prompt)
+        spec = self._kv_spec_for_geometry(
+            geometry,
+            window_frames=contract.window_frames,
+            sink_frames=contract.sink_frames,
+            text_capacity=text_capacity,
+        )
+        return ARDiffusionRequestKVSpec(
+            spec,
+            (geometry.session_key, contract.window_frames, contract.sink_frames, text_capacity),
+        )
+
+    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
+        # Geometry, window and caption limits can change between full clips.
+        # All other structure remains fixed; each requested pool must fit the
+        # runner's memory budget before allocation.
+        expected = replace(
+            self.ar_diffusion_kv_cache_spec(),
+            tokens_per_frame=spec.tokens_per_frame,
+            window_frames=spec.window_frames,
+            sink_frames=spec.sink_frames,
+            cross_attention=(ARDiffusionCrossAttentionKVSpec("text", spec.max_scratch_tokens_per_branch),),
+            max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
+        )
+        invalid_window = spec.window_frames % 2 != 1 if self.manifest.chunk_size == 1 else spec.sink_frames != 0
+        if spec != expected or invalid_window:
+            raise ValueError("Sim-Transfer paged spec must preserve its control/clean history and text capacity.")
+
+    def _validate_bound_kv_geometry(self, state, geometry=None, *, expected_spec=None) -> None:
+        if expected_spec is None:
+            # Binding precedes request admission. Validate fixed structure now;
+            # forward compares the actual request's window/text/geometry too.
+            cache = state.kv_cache
+            paired_sliding = self.manifest.chunk_size == 1
+            expected_spec = self._kv_spec_for_geometry(
+                geometry or self.resolution_policy.resolve(*self.resolution_policy.default_resolution),
+                window_frames=(cache.spec.window_chunks + cache.spec.sink_chunks + 1) // 2
+                if paired_sliding
+                else cache.spec.window_chunks,
+                sink_frames=cache.spec.sink_chunks // 2 if paired_sliding else cache.spec.sink_chunks,
+                text_capacity=cache.cross_attention_lengths.get("text", 0),
+            )
+        cache = state.kv_cache
+        actual = {
+            "num_layers": int(cache.num_layers),
+            "num_kv_heads": int(cache.num_kv_heads),
+            "head_size": int(cache.head_size),
+            "tokens_per_frame": int(cache.block_size),
+            "frames_per_block": int(cache.frames_per_block),
+            "max_scratch_frames_per_branch": int(cache.max_scratch_frames_per_branch),
+            "max_scratch_tokens_per_branch": int(cache.max_scratch_tokens_per_branch),
+            "window_frames": int(cache.spec.window_chunks),
+            "sink_frames": int(cache.spec.sink_chunks),
+            "eviction_group_frames": int(getattr(cache.spec, "eviction_group_frames", 1)),
+            "reset_at_boundary": bool(cache.spec.reset_at_boundary),
+            "text_cache_max_len": int(cache.cross_attention_lengths.get("text", -1)),
+            "max_model_len": int(cache.max_model_len),
+            "kv_branches": tuple(cache.kv_branches),
+            "model_owned_state_bytes_per_session": int(cache.model_owned_state_bytes_per_session),
+        }
+        expected_spec = expected_spec or self._kv_spec_for_geometry(
+            geometry or self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
+        )
+        expected = {
+            "num_layers": int(self.transformer.num_hidden_layers),
+            "num_kv_heads": int(self.transformer.num_kv_heads_local),
+            "head_size": int(self.transformer.head_dim),
+            "tokens_per_frame": int(expected_spec.tokens_per_frame),
+            "frames_per_block": expected_spec.frames_per_block,
+            "max_scratch_frames_per_branch": expected_spec.max_scratch_frames_per_branch,
+            "max_scratch_tokens_per_branch": expected_spec.max_scratch_tokens_per_branch,
+            "window_frames": expected_spec.window_frames,
+            "sink_frames": expected_spec.sink_frames,
+            "eviction_group_frames": expected_spec.eviction_group_frames,
+            "reset_at_boundary": expected_spec.reset_at_boundary,
+            "text_cache_max_len": expected_spec.cross_attention_lengths["text"],
+            "max_model_len": int(expected_spec.max_model_len),
+            "kv_branches": expected_spec.kv_branches,
+            "model_owned_state_bytes_per_session": int(expected_spec.model_owned_state_bytes_per_session),
+        }
+        if geometry is None:
+            # The request is resolved independently in ``forward``. At bind
+            # time only the geometry-dependent block size is intentionally
+            # deferred.
+            expected.pop("tokens_per_frame")
+            actual.pop("tokens_per_frame")
+        mismatches = {name: (expected[name], actual[name]) for name in expected if expected[name] != actual[name]}
+        if mismatches:
+            details = ", ".join(
+                f"{name}=expected {expected_value}, got {actual_value}"
+                for name, (expected_value, actual_value) in mismatches.items()
+            )
+            raise RuntimeError(
+                "Cosmos3-Nano-Sim-Transfer bound AR-Diffusion KV cache violates the "
+                f"resolved model specification ({details})."
+            )
+
+    def _ensure_text_kv(
+        self,
+        state: Cosmos3NanoSimBimanualSessionState,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        *,
+        max_length: int | None = None,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        if self._ar_diffusion_kv_state is None:
+            return super()._ensure_text_kv(state, text_ids, text_mask, max_length=max_length)
+        cached = state.text_kv_by_branch.get(self._MAIN_BRANCH)
+        if cached is not None:
+            return cached
+
+        paged_state = self._ar_diffusion_kv_state
+        if paged_state is not None and paged_state.is_cross_attention_populated(self._MAIN_BRANCH, "text"):
+            pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
+            cached = [(entry["k"], entry["v"]) for entry in pooled]
+        else:
+            raw_kv, real_len = self.transformer.encode_und_kv(text_ids, text_mask)
+            limit = self.manifest.text_cache_max_len if max_length is None else max_length
+            if real_len > limit:
+                raise ValueError(f"{type(self).__name__} prompt exceeds token limit: {real_len} > {limit}.")
+            if paged_state is None:
+                cached = raw_kv
+            else:
+                padded = self.transformer.pad_text_kv(
+                    raw_kv,
+                    max_len=paged_state.kv_cache.cross_attention_lengths["text"],
+                )
+                paged_state.populate_cross_attention(self._MAIN_BRANCH, "text", padded)
+                pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
+                cached = [(entry["k"], entry["v"]) for entry in pooled]
+        state.text_kv_by_branch[self._MAIN_BRANCH] = cached
+        return cached
+
+    def _transformer_forward(
+        self,
+        state: Cosmos3NanoSimBimanualSessionState,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        geometry: Cosmos3NanoSimBimanualGeometry,
+        text_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        real_text_kv_len: int,
+        frame_start: int,
+        fps: float,
+        conditioning_kwargs: Mapping[str, Any],
+        condition_vision: bool,
+        commit_current: bool,
+        frame_causal: bool = False,
+    ) -> Cosmos3NanoSimBimanualTransformerOutput:
+        paged_state = self._ar_diffusion_kv_state
+        if paged_state is None:
+            return super()._transformer_forward(
+                state,
+                hidden_states,
+                timestep,
+                geometry=geometry,
+                text_kv=text_kv,
+                real_text_kv_len=real_text_kv_len,
+                frame_start=frame_start,
+                fps=fps,
+                conditioning_kwargs=conditioning_kwargs,
+                condition_vision=condition_vision,
+                commit_current=commit_current,
+                frame_causal=frame_causal,
+            )
+        tokens_per_frame = geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame)
+        seq_len = hidden_states.shape[2] * tokens_per_frame
+        contexts = paged_state.get_kv_caches(
+            self._MAIN_BRANCH,
+            seq_len=seq_len,
+            commit_current=commit_current,
+            extra_visible_tokens=tokens_per_frame if frame_causal else seq_len,
+            frame_causal=frame_causal,
+        )
+        paged_kv = self._prepare_paged_attention(contexts, text_kv=text_kv, real_text_kv_len=real_text_kv_len)
+        output = self.transformer(
+            hidden_states,
+            timestep,
+            geometry=geometry,
+            text_kv=text_kv,
+            real_text_kv_len=real_text_kv_len,
+            frame_start=frame_start,
+            fps=fps,
+            paged_kv=paged_kv,
+            dense_history=None,
+            condition_vision=condition_vision,
+            frame_causal=frame_causal,
+            history_window=(self.inference_config.sink_frames, self.inference_config.window_frames),
+            **conditioning_kwargs,
+        )
+        paged_state.commit_paged_context(self._MAIN_BRANCH)
+        return output
+
+    def _forward_impl(self, req):
+        if self._ar_diffusion_kv_state is not None and len(req.prompts) == 1:
+            try:
+                expected = self.ar_diffusion_request_spec(req).kv_spec
+                geometry = self._resolve_request_geometry(req.sampling_params, req.prompts[0])
+            except (TypeError, ValueError) as exc:
+                raise ARDiffusionRequestRejectedError(str(exc)) from exc
+            self._validate_bound_kv_geometry(self._ar_diffusion_kv_state, geometry, expected_spec=expected)
+        return super()._forward_impl(req)
 
     def _parse_tick(self, tick):
         del tick
@@ -437,7 +704,7 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         return conditioning_request.num_pixel_frames
 
     def _prompt_token_limit(self, sp: Any, prompt_data: Any) -> int:
-        # Dense text K/V is sized to the prompt, unlike the fixed paged pool.
+        # The paged request spec reserves the same limit for text and scratch.
         limit = _strict_integer(
             self._request_param(sp, prompt_data, "max_prompt_tokens", self.manifest.text_cache_max_len),
             "max_prompt_tokens",
