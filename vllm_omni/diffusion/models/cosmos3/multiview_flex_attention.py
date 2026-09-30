@@ -423,6 +423,71 @@ def build_multiview_flex_metadata(
     )
 
 
+# Sentinels for the equality-coded predicate below.  Every real code is packed
+# from non-negative fields, so a negative code can never match one, and the two
+# sides use different values so an opted-out query never matches an opted-out
+# key.
+_NOMATCH_Q = -1
+_NOMATCH_K = -2
+
+
+def _equality_code_radices(
+    q_vectors: tuple[torch.Tensor, ...],
+    k_vectors: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Radices that keep the packed ``(sample, view)``/``(sample, frame)`` codes injective.
+
+    Returned as device tensors so building the codes never synchronizes.  Both
+    sides must pack with the same radices for their codes to be comparable, so
+    each one covers the widest field either side carries.
+    """
+    view_radix = torch.maximum(q_vectors[2].max(), k_vectors[2].max()) + 3
+    frame_radix = torch.maximum(q_vectors[1].max(), k_vectors[1].max()) + 2
+    return view_radix, frame_radix
+
+
+def _equality_codes(
+    vectors: tuple[torch.Tensor, ...],
+    view_radix: torch.Tensor,
+    frame_radix: torch.Tensor,
+    *,
+    is_query: bool,
+    cross_by_frame: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fold the discrete visibility fields into four comparable int32 codes.
+
+    Each code pairs one query-side tensor with one key-side tensor so that a
+    single ``==`` reproduces one disjunct of the predicate; a token whose code is
+    the side's sentinel simply cannot satisfy that disjunct.  The kernel then
+    needs one narrow load and one comparison per disjunct instead of the six
+    field loads and the dozen boolean operations the algebra spells out.
+    """
+    sample_id, frame_id, view_id, is_control, is_und = vectors[:5]
+    # Shift the sentinels (padding ``-1``, LiDAR view ``-2``) up so every field
+    # is non-negative and the packed codes stay injective.
+    sample = sample_id + 1
+    missing = _NOMATCH_Q if is_query else _NOMATCH_K
+
+    view_code = sample * view_radix + (view_id + 2)
+    cross_code = sample * frame_radix + (frame_id + 1) if cross_by_frame else sample
+    if is_query:
+        # ``same_sample`` alone: the key side narrows the caption disjunct to the
+        # captions that every view reads.
+        caption_code = sample
+        # The LiDAR disjunct fires for a LiDAR query against any caption token.
+        lidar_code = sample.masked_fill(view_id != -2, missing)
+        # Controls never reach another view, so they opt out of the cross-view
+        # disjunct.
+        cross_code = cross_code.masked_fill(is_control, missing)
+    else:
+        caption_code = sample.masked_fill(~(is_und & (view_id == -1)), missing)
+        lidar_code = sample.masked_fill(~is_und, missing)
+        # Reaching another view is sensor-to-sensor only.
+        cross_code = cross_code.masked_fill(is_und | is_control, missing)
+    codes = (view_code, caption_code, lidar_code, cross_code)
+    return tuple(code.to(torch.int32).contiguous() for code in codes)  # type: ignore[return-value]
+
+
 def _make_pair_allowed(
     q_vectors: tuple[torch.Tensor, ...],
     k_vectors: tuple[torch.Tensor, ...],
@@ -449,6 +514,31 @@ def _make_pair_allowed(
     compares_frames = reaches_own_instant and not compares_timestamps
     temporal_window = 0.0 if window_seconds is None else float(window_seconds)
     temporal_window_eps = 1e-4
+
+    if control_attends_sensor and not compares_timestamps:
+        # Every disjunct of the predicate is then a conjunction of equalities on
+        # per-token fields, so precompute one code per disjunct per side and let
+        # the kernel decide each one with a single comparison.  A temporal window
+        # compares an interval rather than a value and keeps the algebra below.
+        view_radix, frame_radix = _equality_code_radices(q_vectors, k_vectors)
+        q_view_code, q_caption_code, q_lidar_code, q_cross_code = _equality_codes(
+            q_vectors, view_radix, frame_radix, is_query=True, cross_by_frame=compares_frames
+        )
+        k_view_code, k_caption_code, k_lidar_code, k_cross_code = _equality_codes(
+            k_vectors, view_radix, frame_radix, is_query=False, cross_by_frame=compares_frames
+        )
+        # The ``same_view`` scope keeps sensors inside their own view entirely.
+        reaches_other_views = reaches_every_view or compares_frames
+
+        def pair_allowed(q_index: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
+            allowed = q_view_code[q_index] == k_view_code[kv_index]
+            allowed = allowed | (q_caption_code[q_index] == k_caption_code[kv_index])
+            allowed = allowed | (q_lidar_code[q_index] == k_lidar_code[kv_index])
+            if reaches_other_views:
+                allowed = allowed | (q_cross_code[q_index] == k_cross_code[kv_index])
+            return allowed
+
+        return pair_allowed
 
     def pair_allowed(q_index: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
         q_sample = q_vectors[0][q_index]
