@@ -270,6 +270,13 @@ class MultiviewFlexMetadata:
     attention_scope: AttentionScope
     decomposed_temporal_window_seconds: float | None = None
     control_attends_sensor: bool = False
+    # Whether this request can actually produce the two sentinel view IDs that
+    # widen a caption's reach beyond its own view. Both default to True so a
+    # hand-built metadata keeps the fully general predicate; the builder below
+    # resolves them from the layout, where they are plain Python facts and cost
+    # no device synchronization.
+    has_viewless_caption: bool = True
+    has_sensor_query: bool = True
 
     @property
     def kv_len(self) -> int:
@@ -420,6 +427,11 @@ def build_multiview_flex_metadata(
         attention_scope=layout.attention_scope,
         decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
         control_attends_sensor=layout.control_attends_sensor,
+        # Captions keep the view-less sentinel only while no caption boundary
+        # claims them; the partition above is validated to cover every real text
+        # token, so per-view captions leave none behind.
+        has_viewless_caption=num_und > 0 and not layout.caption_lengths,
+        has_sensor_query=any(item.is_lidar for item in layout.items),
     )
 
 
@@ -429,6 +441,8 @@ def _make_pair_allowed(
     attention_scope: AttentionScope,
     decomposed_temporal_window_seconds: float | None,
     control_attends_sensor: bool,
+    has_viewless_caption: bool = True,
+    has_sensor_query: bool = True,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Build the exact pair predicate, specialized on the scope configuration.
 
@@ -451,43 +465,58 @@ def _make_pair_allowed(
     temporal_window_eps = 1e-4
 
     def pair_allowed(q_index: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
-        q_sample = q_vectors[0][q_index]
         q_view = q_vectors[2][q_index]
-        q_control = q_vectors[3][q_index]
-        k_sample = k_vectors[0][kv_index]
         k_view = k_vectors[2][kv_index]
-        k_control = k_vectors[3][kv_index]
         k_und = k_vectors[4][kv_index]
+
+        same_view = q_view == k_view
+
+        # Both halves of the UND selection -- a caption's own-view term and the
+        # sensor branch's ``in_view`` -- contain ``same_view``, so factoring it
+        # out of the selection collapses
+        #   (k_und & (sentinels | same_view)) | (~k_und & (in_view | reaches))
+        # into one OR chain over three terms. This is boolean algebra on the
+        # same operands, so every pair keeps its previous verdict and with it
+        # the full-vs-partial block classification the softmax order rests on.
+        #
+        # Inside a view every stream pair is visible, except that controls only
+        # read sensors when the checkpoint enables it; an UND key is exempt.
+        if control_attends_sensor:
+            allowed = same_view
+        else:
+            allowed = same_view & (k_und | k_vectors[3][kv_index] | (~q_vectors[3][q_index]))
+
+        # Sensor-to-sensor pairs are the only ones that reach other views, and
+        # only a real (non-UND) key carries one. Conjoin the two key-side rows
+        # first: that keeps the [1, BLOCK_N] shape until the query column
+        # forces the result out to the full score tile.
+        if reaches_every_view or compares_timestamps or compares_frames:
+            reaches = (~k_und) & (~k_vectors[3][kv_index]) & (~q_vectors[3][q_index])
+            if compares_timestamps:
+                timestamp_gap = q_vectors[5][q_index] - k_vectors[5][kv_index]
+                reaches = reaches & (
+                    (timestamp_gap >= -temporal_window_eps)
+                    & (timestamp_gap <= temporal_window + temporal_window_eps)
+                )
+            elif compares_frames:
+                reaches = reaches & (q_vectors[1][q_index] == k_vectors[1][kv_index])
+            allowed = allowed | reaches
+
+        # What is left of ``reads_caption`` once ``same_view`` has been hoisted:
+        # a sentinel view ID on either side. Whether either can occur at all is
+        # a property of the request, so the dead comparisons never reach the
+        # kernel -- and the widest ones are exactly these, since a key-side row
+        # ORed with a query-side column costs the whole score tile.
+        if has_viewless_caption and has_sensor_query:
+            allowed = allowed | (k_und & ((k_view == -1) | (q_view == -2)))
+        elif has_viewless_caption:
+            allowed = allowed | (k_und & (k_view == -1))
+        elif has_sensor_query:
+            allowed = allowed | (k_und & (q_view == -2))
 
         # Sentinel equality deliberately isolates padding from real tokens
         # while giving every padded query at least one padded key.
-        same_sample = q_sample == k_sample
-        same_view = q_view == k_view
-
-        # Inside a view every stream pair is visible, except that controls
-        # only read sensors when the checkpoint enables it.
-        if control_attends_sensor:
-            in_view = same_view
-        else:
-            in_view = same_view & (k_control | (~q_control))
-
-        # Sensor-to-sensor pairs are the only ones that reach other views.
-        if reaches_every_view:
-            allowed = in_view | ((~q_control) & (~k_control))
-        elif compares_timestamps:
-            timestamp_gap = q_vectors[5][q_index] - k_vectors[5][kv_index]
-            within_temporal_window = (timestamp_gap >= -temporal_window_eps) & (
-                timestamp_gap <= temporal_window + temporal_window_eps
-            )
-            allowed = in_view | ((~q_control) & (~k_control) & within_temporal_window)
-        elif compares_frames:
-            same_frame = q_vectors[1][q_index] == k_vectors[1][kv_index]
-            allowed = in_view | ((~q_control) & (~k_control) & same_frame)
-        else:
-            allowed = in_view
-
-        reads_caption = k_und & ((k_view == -1) | (q_view == -2) | same_view)
-        return same_sample & (reads_caption | ((~k_und) & allowed))
+        return (q_vectors[0][q_index] == k_vectors[0][kv_index]) & allowed
 
     return pair_allowed
 
@@ -504,6 +533,8 @@ def multiview_pair_predicate(
         metadata.attention_scope,
         metadata.decomposed_temporal_window_seconds,
         metadata.control_attends_sensor,
+        metadata.has_viewless_caption,
+        metadata.has_sensor_query,
     )
     return pair_allowed(q_index, kv_index)
 
@@ -664,6 +695,8 @@ def build_multiview_block_sparsity(
         metadata.attention_scope,
         metadata.decomposed_temporal_window_seconds,
         metadata.control_attends_sensor,
+        metadata.has_viewless_caption,
+        metadata.has_sensor_query,
     )
     group_allowed = pair_allowed(q_representatives[:, None], k_representatives[None, :])
     q_presence = _block_group_presence(q_group_ids, q_block_size, q_representatives.numel())
