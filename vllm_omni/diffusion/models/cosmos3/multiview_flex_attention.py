@@ -430,58 +430,64 @@ def _make_pair_allowed(
     decomposed_temporal_window_seconds: float | None,
     control_attends_sensor: bool,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Build the exact pair predicate with tensor-only traced configuration.
+    """Build the exact pair predicate, specialized on the scope configuration.
 
     The returned closure is stored on Triton's ``BlockMask`` and traced by
-    Inductor. Materialize scalar options here, outside that closure, so Python
-    strings, booleans, and floats cannot become dynamic captured scalars. The
-    custom FA4 path uses the same closure eagerly to build its packed run table.
+    Inductor. Resolve the scope options here, outside that closure, so they
+    select the predicate's shape at trace time instead of surviving into the
+    kernel as traced scalars: every branch below is a checkpoint-level
+    constant, so the mask body reduces to the comparisons the configuration
+    actually needs. The custom FA4 path uses the same closure eagerly to
+    build its packed run table.
     """
-    device = q_vectors[2].device
-    reaches_every_view = torch.tensor(attention_scope == "all_views", device=device)
-    is_decomposed = torch.tensor(attention_scope == "decomposed", device=device)
-    control_reaches_sensor = torch.tensor(control_attends_sensor, device=device)
-    has_temporal_window = torch.tensor(decomposed_temporal_window_seconds is not None, device=device)
-    temporal_window = torch.tensor(
-        0.0 if decomposed_temporal_window_seconds is None else decomposed_temporal_window_seconds,
-        dtype=torch.float32,
-        device=device,
-    )
-    temporal_window_eps = torch.tensor(1e-4, dtype=torch.float32, device=device)
+    reaches_every_view = attention_scope == "all_views"
+    reaches_own_instant = attention_scope == "decomposed"
+    # Only the decomposed scope consults frames/timestamps, and only that
+    # scope's window option chooses between them.
+    window_seconds = decomposed_temporal_window_seconds if reaches_own_instant else None
+    compares_timestamps = window_seconds is not None
+    compares_frames = reaches_own_instant and not compares_timestamps
+    temporal_window = 0.0 if window_seconds is None else float(window_seconds)
+    temporal_window_eps = 1e-4
 
     def pair_allowed(q_index: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
         q_sample = q_vectors[0][q_index]
-        q_frame = q_vectors[1][q_index]
         q_view = q_vectors[2][q_index]
         q_control = q_vectors[3][q_index]
-        q_timestamp = q_vectors[5][q_index]
         k_sample = k_vectors[0][kv_index]
-        k_frame = k_vectors[1][kv_index]
         k_view = k_vectors[2][kv_index]
         k_control = k_vectors[3][kv_index]
         k_und = k_vectors[4][kv_index]
-        k_timestamp = k_vectors[5][kv_index]
 
         # Sentinel equality deliberately isolates padding from real tokens
         # while giving every padded query at least one padded key.
         same_sample = q_sample == k_sample
         same_view = q_view == k_view
-        same_frame = q_frame == k_frame
-        timestamp_gap = q_timestamp - k_timestamp
-        within_temporal_window = (timestamp_gap >= -temporal_window_eps) & (
-            timestamp_gap <= temporal_window + temporal_window_eps
-        )
-        reaches_own_instant = is_decomposed & torch.where(has_temporal_window, within_temporal_window, same_frame)
-        in_scope = reaches_every_view | same_view | reaches_own_instant
 
-        sensor_to_sensor = (~q_control) & (~k_control) & in_scope
-        sensor_to_control = (~q_control) & k_control & same_view
-        control_to_control = q_control & k_control & same_view
-        control_to_sensor = control_reaches_sensor & q_control & (~k_control) & same_view
+        # Inside a view every stream pair is visible, except that controls
+        # only read sensors when the checkpoint enables it.
+        if control_attends_sensor:
+            in_view = same_view
+        else:
+            in_view = same_view & (k_control | (~q_control))
+
+        # Sensor-to-sensor pairs are the only ones that reach other views.
+        if reaches_every_view:
+            allowed = in_view | ((~q_control) & (~k_control))
+        elif compares_timestamps:
+            timestamp_gap = q_vectors[5][q_index] - k_vectors[5][kv_index]
+            within_temporal_window = (timestamp_gap >= -temporal_window_eps) & (
+                timestamp_gap <= temporal_window + temporal_window_eps
+            )
+            allowed = in_view | ((~q_control) & (~k_control) & within_temporal_window)
+        elif compares_frames:
+            same_frame = q_vectors[1][q_index] == k_vectors[1][kv_index]
+            allowed = in_view | ((~q_control) & (~k_control) & same_frame)
+        else:
+            allowed = in_view
+
         reads_caption = k_und & ((k_view == -1) | (q_view == -2) | same_view)
-        return same_sample & (
-            reads_caption | (~k_und & (sensor_to_sensor | sensor_to_control | control_to_control | control_to_sensor))
-        )
+        return same_sample & (reads_caption | ((~k_und) & allowed))
 
     return pair_allowed
 

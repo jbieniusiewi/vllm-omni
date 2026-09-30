@@ -348,7 +348,7 @@ def test_decomposed_temporal_window_boundaries(
     assert bool(actual) is expected
 
 
-def test_traced_pair_predicate_captures_tensor_configuration_only() -> None:
+def test_traced_pair_predicate_specializes_scalar_configuration() -> None:
     import inspect
 
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _make_pair_allowed
@@ -366,9 +366,12 @@ def test_traced_pair_predicate_captures_tensor_configuration_only() -> None:
     assert captured
     for value in captured.values():
         if isinstance(value, tuple):
-            assert value and all(isinstance(item, torch.Tensor) for item in value)
+            # Per-token metadata stays in tensors: the closure indexes it.
+            assert value and all(isinstance(item, torch.Tensor) and item.dim() == 1 for item in value)
         else:
-            assert isinstance(value, torch.Tensor)
+            # Scope options are resolved before tracing so the generated mask
+            # body holds no scalar operands to load per element.
+            assert isinstance(value, (bool, int, float, str)) and not isinstance(value, torch.Tensor)
 
 
 def test_attention_metadata_has_no_condition_or_noise_state() -> None:
