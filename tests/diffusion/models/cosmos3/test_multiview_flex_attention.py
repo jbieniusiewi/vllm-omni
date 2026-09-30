@@ -826,6 +826,37 @@ def test_flex_attention_explicitly_pins_triton_backend(monkeypatch: pytest.Monke
     }
 
 
+def test_triton_kernel_options_only_vary_scheduling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tile is fixed on every device; only the scheduling knobs are guarded.
+
+    BLOCK_M/BLOCK_N have to keep matching the sparse block size the mask is built
+    at, otherwise the kernel would reclassify which blocks are fully visible and
+    the output would change. Stage count and TMA do not touch the accumulation
+    order, so they can be tuned per architecture.
+    """
+    import vllm_omni.diffusion.models.cosmos3.multiview_flex_attention as module
+
+    def options_for(device_type: str, capability: tuple[int, int]) -> dict[str, object]:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+        return module._triton_kernel_options(torch.device(device_type))
+
+    hopper = options_for("cuda", (9, 0))
+    blackwell = options_for("cuda", (10, 0))
+    cpu = options_for("cpu", (9, 0))
+
+    for options in (hopper, blackwell, cpu):
+        assert options["BACKEND"] == "TRITON"
+        assert options["BLOCK_M"] == module.SPARSE_Q_BLOCK_SIZE
+        assert options["BLOCK_N"] == module.SPARSE_KV_BLOCK_SIZE
+        assert options["num_warps"] == module.TRITON_NUM_WARPS
+
+    # Tuned only where the tile budget has been measured.
+    assert (hopper["num_stages"], hopper["USE_TMA"]) == (module.TRITON_NUM_STAGES, module.TRITON_USE_TMA)
+    # Unvalidated architectures and non-CUDA devices keep the conservative fallback.
+    assert (blackwell["num_stages"], blackwell["USE_TMA"]) == (1, False)
+    assert (cpu["num_stages"], cpu["USE_TMA"]) == (1, False)
+
+
 def test_decomposed_without_window_rejects_mixed_view_offsets() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,

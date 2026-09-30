@@ -27,13 +27,49 @@ SPARSE_KV_BLOCK_SIZE = 64
 # 128x64 with three stages and eight warps. The multiview mask_mod adds enough
 # state that the default first exceeded shared-memory capacity and, after only
 # shrinking BLOCK_N, produced an illegal access at launch. Use the smallest
-# square tile supported by the forward autotuner, remove software pipelining,
-# and keep TMA disabled. Aligning the sparse mask blocks with the compute tile
-# also avoids sub-block address arithmetic in the generated kernel.
+# square tile supported by the forward autotuner and keep the sparse mask blocks
+# aligned with the compute tile, which also avoids sub-block address arithmetic
+# in the generated kernel.
 TRITON_Q_BLOCK_SIZE = 64
 TRITON_KV_BLOCK_SIZE = 64
-TRITON_NUM_STAGES = 1
 TRITON_NUM_WARPS = 4
+# Software pipelining stages. Single-stage is the SM100 fallback that came out of
+# the shared-memory failure above; it leaves the K/V global loads unoverlapped,
+# which on a 64x64 head_dim=128 tile is where most of the kernel's time goes.
+# One extra stage is enough to hide them and still asks for far less shared
+# memory than the 128x64 three-stage default that failed. Measured on an H100
+# PCIe at the released 11-view 480p geometry (68,640 GEN queries, 72,832 keys,
+# 12.7% visited blocks): 70.8 ms -> 57.4 ms per call.
+TRITON_NUM_STAGES = 2
+# ...and the same tile with TMA descriptors for the K/V loads: 57.4 ms -> 53.5 ms.
+# Inductor drops back to the ordinary loads when the device or the packed q/k/v
+# layout cannot support TMA, so requesting it is safe on any hardware.
+TRITON_USE_TMA = True
+# Architectures whose FlexAttention tile budget this file has not been able to
+# validate keep the conservative single-stage, no-TMA configuration. SM100 is the
+# architecture the comment above describes; treat anything newer the same way
+# rather than assuming a tile that has never run there.
+_TRITON_UNVALIDATED_ARCH_MAJOR = 10
+
+
+def _triton_kernel_options(device: torch.device) -> dict[str, Any]:
+    """Pinned Triton FlexAttention tile for ``device``.
+
+    The tile itself (64x64, four warps) is fixed: it is the granularity the
+    sparse block map is built at, so changing it would change which blocks the
+    kernel treats as fully visible. Only the scheduling knobs vary, and those do
+    not affect the accumulation order, so every device produces the same bits.
+    """
+    validated = device.type == "cuda" and torch.cuda.get_device_capability(device)[0] < _TRITON_UNVALIDATED_ARCH_MAJOR
+    return {
+        "BACKEND": "TRITON",
+        "BLOCK_M": TRITON_Q_BLOCK_SIZE,
+        "BLOCK_N": TRITON_KV_BLOCK_SIZE,
+        "num_stages": TRITON_NUM_STAGES if validated else 1,
+        "num_warps": TRITON_NUM_WARPS,
+        "USE_TMA": TRITON_USE_TMA and validated,
+    }
+
 
 # FlashAttention-4 runs a fixed 128x128 forward tile on SM100 and stages two Q
 # tiles per CTA whenever the query length exceeds one tile, so the sparse block
@@ -807,14 +843,7 @@ def flex_attention(
         raise ValueError(f"Cosmos3 multiview v1 supports only backend='triton', got {backend!r}.")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("Cosmos3 multiview FlexAttention requires contiguous [B, H, S, D] inputs.")
-    kernel_options = {
-        "BACKEND": "TRITON",
-        "BLOCK_M": TRITON_Q_BLOCK_SIZE,
-        "BLOCK_N": TRITON_KV_BLOCK_SIZE,
-        "num_stages": TRITON_NUM_STAGES,
-        "num_warps": TRITON_NUM_WARPS,
-        "USE_TMA": False,
-    }
+    kernel_options = _triton_kernel_options(q.device)
     if q.device.type == "cuda":
         global _compiled_flex_attention
         if _compiled_flex_attention is None:
