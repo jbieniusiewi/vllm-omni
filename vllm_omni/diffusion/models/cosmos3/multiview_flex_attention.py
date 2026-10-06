@@ -421,6 +421,97 @@ def build_multiview_flex_metadata(
     )
 
 
+# ``mask_mod`` runs inside the Triton kernel on every partially masked tile, and
+# the straightforward form gathers ten separate per-token vectors there: five
+# discrete fields plus the float timestamp, for each side.  Those gathers, not
+# the boolean algebra, are what the tile pays for.  Measured on the released
+# 11-view / 561-frame / 15x26 geometry (H200, SM90), replacing the predicate
+# with a trivially true one saves only 8% of the kernel, so the algebra is
+# nearly free; serving the same five discrete fields from one packed int32 code
+# per side recovers 5% of the whole kernel.
+#
+# The five discrete fields are small integers, so after a constant bias they
+# pack losslessly into one int32 word.  Field equality then becomes a masked
+# compare against zero on the XOR of the two codes, and a field-to-constant test
+# becomes a masked compare against that constant's encoding -- the same
+# comparisons the unpacked form makes on the same values, so the predicate is
+# bit-identical rather than merely close.  Only the timestamp stays a float
+# gather: ``seconds_per_frame`` differs between the camera and LiDAR streams, so
+# a timestamp is not a function of ``frame_id`` alone and cannot join the code.
+# It is also gathered only when a temporal window is configured.
+#
+# ``_pack_pair_fields`` returns ``None`` when the fields do not fit (an
+# unexpectedly large frame count, say), and the unpacked predicate below still
+# serves that case, so this is an optimization and never a new constraint on
+# what a layout may express.
+_PACK_TOTAL_BITS = 31  # stay inside int32 without disturbing the sign bit
+
+# The predicate compares ``view_id`` against the caption (-1) and LiDAR (-2)
+# sentinels, so the view field must be able to encode them whether or not the
+# layout actually contains either.
+_MIN_ENCODABLE_VIEW_ID = -2
+
+
+@dataclass(frozen=True)
+class _PackedPairFields:
+    """One int32 code per token holding the five discrete visibility fields."""
+
+    q_code: torch.Tensor
+    k_code: torch.Tensor
+    sample_mask: int
+    view_mask: int
+    frame_mask: int
+    control_bit: int
+    und_bit: int
+    view_lidar: int
+    view_caption: int
+
+
+def _pack_pair_fields(
+    q_vectors: tuple[torch.Tensor, ...],
+    k_vectors: tuple[torch.Tensor, ...],
+) -> _PackedPairFields | None:
+    """Pack ``sample``/``view``/``frame``/``is_control``/``is_und`` into one word per token."""
+    fields = []
+    shift = 0
+    for q_field, k_field, floor in (
+        (q_vectors[0], k_vectors[0], None),
+        (q_vectors[2], k_vectors[2], _MIN_ENCODABLE_VIEW_ID),
+        (q_vectors[1], k_vectors[1], None),
+    ):
+        low = min(int(q_field.min()), int(k_field.min()))
+        high = max(int(q_field.max()), int(k_field.max()))
+        if floor is not None:
+            low = min(low, floor)
+        width = max(1, int(high - low + 1).bit_length())
+        fields.append((q_field, k_field, shift, -low, ((1 << width) - 1) << shift))
+        shift += width
+    if shift + 2 > _PACK_TOTAL_BITS:  # two single-bit flags still to place
+        return None
+    control_shift, und_shift = shift, shift + 1
+
+    def encode(vectors: tuple[torch.Tensor, ...], side: int) -> torch.Tensor:
+        code = torch.zeros_like(vectors[0])
+        for field in fields:
+            code |= (field[side] + field[3]) << field[2]
+        code |= vectors[3].to(code.dtype) << control_shift
+        code |= vectors[4].to(code.dtype) << und_shift
+        return code.to(torch.int32).contiguous()
+
+    sample, view, frame = fields
+    return _PackedPairFields(
+        q_code=encode(q_vectors, 0),
+        k_code=encode(k_vectors, 1),
+        sample_mask=sample[4],
+        view_mask=view[4],
+        frame_mask=frame[4],
+        control_bit=1 << control_shift,
+        und_bit=1 << und_shift,
+        view_lidar=(_MIN_ENCODABLE_VIEW_ID + view[3]) << view[2],
+        view_caption=(-1 + view[3]) << view[2],
+    )
+
+
 def _make_pair_allowed(
     q_vectors: tuple[torch.Tensor, ...],
     k_vectors: tuple[torch.Tensor, ...],
@@ -429,12 +520,100 @@ def _make_pair_allowed(
     control_attends_sensor: bool,
     lidar_attends_captions: bool = True,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Build the exact pair predicate with tensor-only traced configuration.
+    """Build the exact pair predicate over packed per-token field codes.
 
     The returned closure is stored on Triton's ``BlockMask`` and traced by
-    Inductor. Materialize scalar options here, outside that closure, so Python
-    strings, booleans, and floats cannot become dynamic captured scalars. The
+    Inductor. The scope and flag configuration is resolved here, outside that
+    closure, so Python strings, booleans, and floats cannot become dynamic
+    captured scalars; what survives into the trace is the packed codes, the
+    integer field masks, and (only for a windowed scope) the timestamps. The
     custom FA4 path uses the same closure eagerly to build its packed run table.
+    """
+    packed = _pack_pair_fields(q_vectors, k_vectors)
+    if packed is None:
+        return _make_pair_allowed_unpacked(
+            q_vectors,
+            k_vectors,
+            attention_scope,
+            decomposed_temporal_window_seconds,
+            control_attends_sensor,
+            lidar_attends_captions,
+        )
+    q_code, k_code = packed.q_code, packed.k_code
+    sample_mask, view_mask, frame_mask = packed.sample_mask, packed.view_mask, packed.frame_mask
+    control_bit, und_bit = packed.control_bit, packed.und_bit
+    view_lidar, view_caption = packed.view_lidar, packed.view_caption
+    reaches_every_view = attention_scope == "all_views"
+    is_decomposed = attention_scope == "decomposed"
+    has_temporal_window = decomposed_temporal_window_seconds is not None
+    device = q_vectors[2].device
+    q_timestamp_all = k_timestamp_all = None
+    temporal_window = temporal_window_eps = None
+    if is_decomposed and has_temporal_window:
+        q_timestamp_all, k_timestamp_all = q_vectors[5], k_vectors[5]
+        temporal_window = torch.tensor(
+            decomposed_temporal_window_seconds, dtype=torch.float32, device=device
+        )
+        temporal_window_eps = torch.tensor(1e-4, dtype=torch.float32, device=device)
+
+    def pair_allowed(q_index: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
+        q_fields = q_code[q_index]
+        k_fields = k_code[kv_index]
+        differing = q_fields ^ k_fields
+
+        # Sentinel equality deliberately isolates padding from real tokens
+        # while giving every padded query at least one padded key.
+        same_sample = (differing & sample_mask) == 0
+        same_view = (differing & view_mask) == 0
+        q_control = (q_fields & control_bit) != 0
+        k_control = (k_fields & control_bit) != 0
+        k_und = (k_fields & und_bit) != 0
+
+        if reaches_every_view:
+            in_scope = None  # every pair is in scope; drop the term entirely
+        else:
+            in_scope = same_view
+            if is_decomposed:
+                if has_temporal_window:
+                    timestamp_gap = q_timestamp_all[q_index] - k_timestamp_all[kv_index]
+                    reaches_own_instant = (timestamp_gap >= -temporal_window_eps) & (
+                        timestamp_gap <= temporal_window + temporal_window_eps
+                    )
+                else:
+                    reaches_own_instant = (differing & frame_mask) == 0
+                in_scope = in_scope | reaches_own_instant
+
+        sensor_to_sensor = (~q_control) & (~k_control)
+        if in_scope is not None:
+            sensor_to_sensor = sensor_to_sensor & in_scope
+        sensor_to_control = (~q_control) & k_control & same_view
+        control_to_control = q_control & k_control & same_view
+        visible_gen = sensor_to_sensor | sensor_to_control | control_to_control
+        if control_attends_sensor:
+            visible_gen = visible_gen | (q_control & (~k_control) & same_view)
+        reads_caption = k_und & (
+            ((k_fields & view_mask) == view_caption) | ((q_fields & view_mask) == view_lidar) | same_view
+        )
+        if not lidar_attends_captions:
+            reads_caption = reads_caption & ((q_fields & view_mask) != view_lidar)
+        return same_sample & (reads_caption | (~k_und & visible_gen))
+
+    return pair_allowed
+
+
+def _make_pair_allowed_unpacked(
+    q_vectors: tuple[torch.Tensor, ...],
+    k_vectors: tuple[torch.Tensor, ...],
+    attention_scope: AttentionScope,
+    decomposed_temporal_window_seconds: float | None,
+    control_attends_sensor: bool,
+    lidar_attends_captions: bool = True,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Field-at-a-time predicate, for layouts whose fields do not fit one word.
+
+    Kept as the reference form of the rule: it reads each metadata vector
+    directly, so it is the definition ``_make_pair_allowed``'s packed codes are
+    required to reproduce bit-for-bit.
     """
     device = q_vectors[2].device
     reaches_every_view = torch.tensor(attention_scope == "all_views", device=device)
