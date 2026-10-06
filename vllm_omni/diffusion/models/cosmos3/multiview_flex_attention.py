@@ -49,6 +49,31 @@ TRITON_NUM_STAGES = 2
 TRITON_NUM_WARPS = 4
 TRITON_USE_TMA = True
 
+# GQA query packing (see ``_gqa_packed_flex_attention``).
+#
+# The grid above is one CTA per (query block, head), so with 32 query heads
+# sharing 8 KV heads every KV tile is fetched from HBM four times -- once per
+# member of its GQA group. At the released 11-view geometry that is ~5.4 TB of
+# K/V traffic for a 930 ms kernel, i.e. the kernel is HBM bound, not FLOP bound.
+#
+# Interleaving the group's queries into the sequence dimension of the shared KV
+# head (``[B, Hkv, S*G, D]``, position-major) lets one CTA cover all G heads of
+# a position block, so each KV tile is loaded once and reused G times from
+# shared memory. Each query row still sees exactly the same keys in the same
+# tile order and the same softmax accumulation order, so the result is
+# bit-identical -- only the HBM traffic changes.
+#
+# With G=4 the packed Q tile holds 32 positions x 4 heads. BLOCK_M=128 at eight
+# warps keeps one 64-position sparse block per two Q tiles while halving KV
+# traffic; deeper KV pipelining then pays off because the tile is reused G
+# times. Measured on the released 11-view / 561-frame / 15x26 geometry
+# (H200, SM90): 931 ms unpacked, 1029 ms packed at two stages, 865 ms at four,
+# 856 ms at five, and 1473 ms at six once the K/V double buffer exceeds the
+# 228 KiB opt-in shared-memory budget and occupancy collapses.
+GQA_PACKED_BLOCK_M = 128
+GQA_PACKED_NUM_WARPS = 8
+GQA_PACKED_NUM_STAGES = 5
+
 # FlashAttention-4 runs a fixed 128x128 forward tile on SM100/SM110 and stages
 # two Q tiles per CTA whenever the query length exceeds one tile, so the sparse
 # block map it consumes must be (2 * tile_m, tile_n).  These are not tunable: the
@@ -860,18 +885,29 @@ def flex_attention(
     *,
     block_mask: BlockMask,
     backend: str,
+    enable_gqa: bool = True,
+    block_m: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> torch.Tensor:
-    """Run pinned Triton FlexAttention on contiguous ``[B, H, S, D]`` tensors."""
+    """Run pinned Triton FlexAttention on contiguous ``[B, H, S, D]`` tensors.
+
+    The tile overrides serve the GQA-packed layout, whose query rows are
+    interleaved group members rather than bare positions; they only change how
+    tiles reach shared memory, never the tile sequence or the accumulation
+    order. ``enable_gqa=False`` is required there because the packing has
+    already matched the query and KV head counts.
+    """
     if backend != "triton":
         raise ValueError(f"Cosmos3 multiview v1 supports only backend='triton', got {backend!r}.")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("Cosmos3 multiview FlexAttention requires contiguous [B, H, S, D] inputs.")
     kernel_options = {
         "BACKEND": "TRITON",
-        "BLOCK_M": TRITON_Q_BLOCK_SIZE,
+        "BLOCK_M": TRITON_Q_BLOCK_SIZE if block_m is None else block_m,
         "BLOCK_N": TRITON_KV_BLOCK_SIZE,
-        "num_stages": TRITON_NUM_STAGES,
-        "num_warps": TRITON_NUM_WARPS,
+        "num_stages": TRITON_NUM_STAGES if num_stages is None else num_stages,
+        "num_warps": TRITON_NUM_WARPS if num_warps is None else num_warps,
         "USE_TMA": TRITON_USE_TMA,
     }
     if q.device.type == "cuda":
@@ -883,7 +919,7 @@ def flex_attention(
             k,
             v,
             block_mask=block_mask,
-            enable_gqa=True,
+            enable_gqa=enable_gqa,
             kernel_options=kernel_options,
         )
     else:
@@ -894,10 +930,129 @@ def flex_attention(
             k,
             v,
             block_mask=block_mask,
-            enable_gqa=True,
+            enable_gqa=enable_gqa,
             kernel_options=kernel_options,
         )
     return output
+
+
+def _gqa_packed_shared_memory_bytes(block_n: int, head_dim: int, num_stages: int, element_size: int) -> int:
+    """Shared memory the Triton template's K/V pipeline needs for one CTA.
+
+    The template double buffers ``num_stages`` K tiles and ``num_stages`` V
+    tiles of ``block_n x head_dim``. Matches the 83,232 B the released kernel
+    reports at ``BLOCK_N=64``, two stages, head_dim 128, bf16.
+    """
+    return 2 * num_stages * block_n * head_dim * element_size
+
+
+def _gqa_packed_num_stages(q: torch.Tensor, block_n: int) -> int:
+    """Clamp the KV pipeline depth to what this device's shared memory allows.
+
+    Deeper pipelining is what makes the packed layout pay off, but a tile that
+    does not fit is a launch failure rather than a slow kernel, so the depth is
+    chosen from the device's opt-in shared-memory budget instead of being
+    assumed. Falls back to the unpacked default when even that does not fit.
+    """
+    properties = torch.cuda.get_device_properties(q.device)
+    budget = getattr(properties, "shared_memory_per_block_optin", None) or properties.shared_memory_per_block
+    for num_stages in range(GQA_PACKED_NUM_STAGES, TRITON_NUM_STAGES - 1, -1):
+        if _gqa_packed_shared_memory_bytes(block_n, q.shape[-1], num_stages, q.element_size()) <= budget:
+            return num_stages
+    return 0
+
+
+def _gqa_packed_plan(
+    plan: BlockMask,
+    group_size: int,
+    sparse_q_block_size: int,
+) -> BlockMask:
+    """Re-express a GEN-row block mask over the packed query sequence.
+
+    The packed sequence interleaves the group's heads inside each position, so
+    packed row ``i`` is logical row ``i // group_size`` and one sparse Q block
+    of ``sparse_q_block_size`` logical rows becomes one block of
+    ``sparse_q_block_size * group_size`` packed rows. The KV axis is untouched,
+    so the existing counts/indices are reused verbatim and only the row stride
+    and the ``mask_mod``'s query index change.
+    """
+    inner_mask_mod = plan.mask_mod
+
+    def mask_mod(
+        batch: torch.Tensor, head: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+    ) -> torch.Tensor:
+        return inner_mask_mod(batch, head, q_idx // group_size, kv_idx)
+
+    packed_q_len = plan.seq_lengths[0] * group_size
+    return BlockMask.from_kv_blocks(
+        plan.kv_num_blocks,
+        plan.kv_indices,
+        plan.full_kv_num_blocks,
+        plan.full_kv_indices,
+        BLOCK_SIZE=(sparse_q_block_size * group_size, plan.BLOCK_SIZE[1]),
+        mask_mod=mask_mod,
+        seq_lengths=(packed_q_len, plan.seq_lengths[1]),
+        compute_q_blocks=False,
+    )
+
+
+def _gqa_packed_flex_attention(
+    q_padded: torch.Tensor,
+    k_all: torch.Tensor,
+    v_all: torch.Tensor,
+    *,
+    plan: BlockMask,
+    context: MultiviewAttentionContext,
+    group_size: int,
+) -> torch.Tensor | None:
+    """Attend with the GQA group interleaved into the query sequence.
+
+    Returns ``None`` when the packed layout does not apply, so the caller falls
+    back to the ordinary GQA broadcast. Inputs/outputs are the Triton path's
+    ``[B, H, S, D]``; see ``GQA_PACKED_BLOCK_M`` for why this is faster and why
+    it is bit-identical.
+    """
+    batch, num_q_heads, padded_q_len, head_dim = q_padded.shape
+    block_m = GQA_PACKED_BLOCK_M
+    sparse_q_block_size, sparse_kv_block_size = plan.BLOCK_SIZE
+    # One CTA must cover whole positions, and the packed sparse block must stay
+    # a multiple of the compute tile for the template's static assertions.
+    if (
+        q_padded.device.type != "cuda"
+        or group_size < 2
+        or block_m % group_size
+        or (sparse_q_block_size * group_size) % block_m
+    ):
+        return None
+    num_stages = _gqa_packed_num_stages(q_padded, sparse_kv_block_size)
+    if num_stages < TRITON_NUM_STAGES:
+        return None
+
+    num_kv_heads = num_q_heads // group_size
+    # Position-major within each KV head: packed row (s * G + g) is logical row
+    # s of group member g, which is what _gqa_packed_plan's mask_mod assumes.
+    packed = _packing_buffer(
+        context.buffer_cache, "gqa:q", q_padded, (batch, num_kv_heads, padded_q_len * group_size, head_dim)
+    )
+    packed.view(batch, num_kv_heads, padded_q_len, group_size, head_dim).copy_(
+        q_padded.view(batch, num_kv_heads, group_size, padded_q_len, head_dim).transpose(2, 3)
+    )
+    output = flex_attention(
+        packed,
+        k_all,
+        v_all,
+        block_mask=_gqa_packed_plan(plan, group_size, sparse_q_block_size),
+        backend=context.layout.backend,
+        enable_gqa=False,
+        block_m=block_m,
+        num_warps=GQA_PACKED_NUM_WARPS,
+        num_stages=num_stages,
+    )
+    return (
+        output.view(batch, num_kv_heads, padded_q_len, group_size, head_dim)
+        .transpose(2, 3)
+        .reshape(batch, num_q_heads, padded_q_len, head_dim)
+    )
 
 
 @torch.compiler.disable
@@ -971,5 +1126,12 @@ def padded_multiview_flex_attention(
         output = multiview_fa4_attention(q_padded, k_all, v_all, plan)
         return output[:, : geometry.real_q_len]
 
-    output = flex_attention(q_padded, k_all, v_all, block_mask=plan, backend=context.layout.backend)
+    # Fold the GQA group into the query sequence when it applies, so each KV
+    # tile is read from HBM once per group instead of once per query head.
+    group_size = q_padded.shape[1] // k_all.shape[1]
+    output = _gqa_packed_flex_attention(
+        q_padded, k_all, v_all, plan=plan, context=context, group_size=group_size
+    )
+    if output is None:
+        output = flex_attention(q_padded, k_all, v_all, block_mask=plan, backend=context.layout.backend)
     return output[:, :, : geometry.real_q_len].transpose(1, 2)
