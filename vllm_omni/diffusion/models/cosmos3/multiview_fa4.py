@@ -33,6 +33,18 @@ def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1):
     FA4 wraps aux indices modulo sequence lengths and masks padded lanes, so
     the token maps must cover those lengths exactly. Scalar callbacks return
     Boolean predicates; SM100/SM110 vector callbacks return packed Uint32 bits.
+
+    Vector uniform-run fast path: run ids never decrease along the key axis
+    (``_semantic_groups`` builds them as a cumsum of change flags), and FA4's
+    key maps are padded to full sparse-block multiples, so the ``vec_size`` keys
+    of one vector call are consecutive and ``n_idx[0]`` / ``n_idx[vec_size - 1]``
+    are its smallest / largest key. When those two endpoints share a run id,
+    every lane in between shares it too, so one table bit answers the whole
+    vector and the per-lane loop is skipped. Any case that breaks the
+    consecutive-endpoint assumption (a wrapped tile where ``g0 > g1``, or an
+    endpoint pair that happens to collide across a differing interior) is not
+    taken by this guard in the padded geometry; were it ever reached it would
+    only widen the fast path, so the exact per-lane loop remains the fallback.
     """
     if vec_size not in (1, 8, 32):
         raise ValueError(f"Cosmos3 multiview FA4 mask vector size must be 1, 8, or 32, got {vec_size}.")
@@ -53,22 +65,46 @@ def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1):
         # FA4 broadcasts one logical query row across the vector, including
         # when GQA packs multiple heads into the physical query tile.
         base = q_word_base[m_idx[0]]
+
         if cutlass.const_expr(vec_size == 1):
             result = cute.make_rmem_tensor(n_idx.shape, dtype=cutlass.Boolean)
-        else:
-            result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
-            result[0] = cutlass.Uint32(0)
-        for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
-            group_k = k_group_ids[n_idx[j]]
-            # Run ids are non-negative, so the unsigned read is lossless and lets
-            # the divide and modulo reduce to one shift each.
-            group_u = cutlass.Uint32(group_k)
-            word = allowed_words[base + cutlass.Int32(group_u // cutlass.Uint32(32))]
-            shift = group_u % cutlass.Uint32(32)
-            keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
-            if cutlass.const_expr(vec_size == 1):
+            for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
+                # Run ids are non-negative, so the unsigned read is lossless and
+                # lets the divide and modulo reduce to one shift each.
+                group_u = cutlass.Uint32(k_group_ids[n_idx[j]])
+                word = allowed_words[base + cutlass.Int32(group_u // cutlass.Uint32(32))]
+                shift = group_u % cutlass.Uint32(32)
+                keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
                 result[j] = cutlass.Boolean(keep)
-            else:
+            return result.load()
+
+        # SM100/SM110 vector callback: return the per-lane keep bits packed into
+        # one Uint32 (bit j = lane j).
+        result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+        result[0] = cutlass.Uint32(0)
+        last = cute.size(n_idx.shape) - 1
+        g0 = cutlass.Uint32(k_group_ids[n_idx[0]])
+        g1 = cutlass.Uint32(k_group_ids[n_idx[last]])
+        # The DSL lowers ``if g0 == g1`` to a dynamic branch and carries every
+        # name a branch binds across the join, so each must already hold its
+        # final type here; otherwise it is ``None`` on the other path. Declaring
+        # the fallback's locals up front keeps the join type-stable.
+        group_u = cutlass.Uint32(0)
+        word = allowed_words[base]
+        shift = cutlass.Uint32(0)
+        keep = cutlass.Uint32(0)
+        if g0 == g1:
+            # Uniform run: one bit decides every lane. ``Uint32(0) - keep`` is
+            # 0xFFFFFFFF when kept and 0 otherwise -- no per-lane packing.
+            word = allowed_words[base + cutlass.Int32(g0 // cutlass.Uint32(32))]
+            keep = fa_utils.shr_u32(cutlass.Uint32(word), g0 % cutlass.Uint32(32)) & cutlass.Uint32(1)
+            result[0] = cutlass.Uint32(0) - keep
+        else:
+            for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
+                group_u = cutlass.Uint32(k_group_ids[n_idx[j]])
+                word = allowed_words[base + cutlass.Int32(group_u // cutlass.Uint32(32))]
+                shift = group_u % cutlass.Uint32(32)
+                keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
                 result[0] = result[0] | (keep << cutlass.Uint32(j))
         return result.load()
 

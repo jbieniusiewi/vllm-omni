@@ -437,6 +437,10 @@ def _semantic_groups(vectors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, t
     changed[:1] = True
     for vector in vectors:
         changed[1:] |= vector[1:] != vector[:-1]
+    # A cumulative sum of change flags, so run ids are monotonically
+    # non-decreasing along the token axis and never repeat after a gap. The FA4
+    # vector mask fast path relies on this: equal run ids at the two endpoints
+    # of a consecutive key span imply one shared run across the whole span.
     group_ids = changed.to(torch.int64).cumsum(0) - 1
     representatives = torch.nonzero(changed, as_tuple=False).flatten()
     return group_ids, representatives
@@ -570,6 +574,9 @@ def build_multiview_block_sparsity(
     k_vectors = metadata.key_vectors()
     q_group_ids, q_representatives = _semantic_groups(metadata.query_grouping_vectors())
     k_group_ids, k_representatives = _semantic_groups(metadata.key_grouping_vectors())
+    # The FA4 vector mask fast path assumes key run ids never decrease. Assert it
+    # once per built mask; this is async and adds no device sync to the launch.
+    torch._assert_async((k_group_ids[1:] >= k_group_ids[:-1]).all())
 
     pair_allowed = _make_pair_allowed(
         q_vectors,

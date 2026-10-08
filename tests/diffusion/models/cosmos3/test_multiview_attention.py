@@ -15,6 +15,7 @@ from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
     MultiviewLayout,
     PaddedAttentionGeometry,
     _pack_padded_bshd,
+    _semantic_groups,
     build_multiview_block_sparsity,
     build_multiview_flex_metadata,
     get_multiview_attention_plan,
@@ -204,3 +205,152 @@ def test_triton_attention_numerically_matches_dense_on_cpu() -> None:
 def test_cuda_attention_numerically_matches_dense(backend: str, compiled: bool) -> None:
     # Triton's production entrypoint compiles the dynamic-shape Flex kernel.
     _numerical_comparison("cuda", backend, torch.bfloat16, compiled=compiled)
+
+
+# -- FA4 vector mask uniform-run fast path -----------------------------------
+#
+# The SM100/SM110 vector callback answers a whole 32-key vector from one table
+# bit when the vector's first and last key share a semantic run. These CPU tests
+# pin the two invariants that fast path relies on: key run ids never decrease,
+# and the packed result equals the exact per-key fallback (and the predicate) for
+# every lane -- including short runs where neighbouring lanes fall in different
+# runs and the fallback loop must run.
+
+
+def _fa4_metadata_and_sparsity(layout: MultiviewLayout, real_und_len: int):
+    q_block, kv_block = layout.block_sizes
+    q_len = math.ceil(layout.gen_tokens / q_block) * q_block
+    und_len = math.ceil(layout.max_und_tokens / kv_block) * kv_block
+    geometry = PaddedAttentionGeometry(layout.gen_tokens, q_len, real_und_len, und_len)
+    metadata = build_multiview_flex_metadata(layout, geometry, torch.device("cpu"))
+    sparsity = build_multiview_block_sparsity(metadata, q_block_size=q_block, kv_block_size=kv_block)
+    return metadata, sparsity
+
+
+@pytest.mark.cpu
+def test_fa4_key_run_ids_never_decrease() -> None:
+    # One layout exercises captions, control, LiDAR, and padding at once; the run
+    # ids over its key (and query) fields must be monotonically non-decreasing.
+    _, sparsity = _fa4_metadata_and_sparsity(_layout(backend="fa4"), real_und_len=5)
+    k_group_ids = sparsity.k_group_ids
+    assert int(k_group_ids[0]) == 0
+    assert bool((k_group_ids[1:] >= k_group_ids[:-1]).all()), "key run ids must never decrease"
+    # The same invariant on the raw grouping helper, across every field tuple.
+    metadata, _ = _fa4_metadata_and_sparsity(_layout(backend="fa4"), real_und_len=5)
+    for vectors in (metadata.key_grouping_vectors(), metadata.query_grouping_vectors()):
+        group_ids, _ = _semantic_groups(vectors)
+        assert bool((group_ids[1:] >= group_ids[:-1]).all())
+        assert int(group_ids.min()) == 0
+
+
+class _U32(int):
+    """Minimal unsigned 32-bit int so the CuTe callback runs on the CPU."""
+
+    _M = 0xFFFFFFFF
+
+    def __new__(cls, value: int) -> "_U32":
+        return int.__new__(cls, int(value) & cls._M)
+
+    def __add__(self, o): return _U32((int(self) + int(o)) & self._M)
+    def __sub__(self, o): return _U32((int(self) - int(o)) & self._M)
+    def __lshift__(self, o): return _U32((int(self) << int(o)) & self._M)
+    def __rshift__(self, o): return _U32(int(self) >> int(o))
+    def __and__(self, o): return _U32(int(self) & int(o))
+    def __or__(self, o): return _U32(int(self) | int(o))
+    def __floordiv__(self, o): return _U32(int(self) // int(o))
+    def __mod__(self, o): return _U32(int(self) % int(o))
+    def __eq__(self, o): return int(self) == int(o)
+    def __hash__(self): return int.__hash__(self)
+
+
+class _Vec:
+    def __init__(self, data) -> None:
+        self.data = list(data)
+
+    def __getitem__(self, i):
+        return self.data[i]
+
+    @property
+    def shape(self):
+        return self
+
+
+class _Res:
+    def __init__(self, n: int) -> None:
+        self.data = [0] * n
+
+    def __getitem__(self, i):
+        return self.data[i]
+
+    def __setitem__(self, i, v) -> None:
+        self.data[i] = v
+
+    def load(self):
+        return self.data[0] if len(self.data) == 1 else list(self.data)
+
+
+def _cute_cpu_stubs():
+    import types
+
+    cutlass = types.SimpleNamespace(
+        Uint32=_U32,
+        Int32=lambda v: int(v),
+        Boolean=lambda v: bool(int(v)),
+        const_expr=lambda v: v,
+        range_constexpr=lambda n: range(n),
+    )
+    cute = types.SimpleNamespace(
+        jit=lambda fn: fn,
+        size=lambda s: len(s.data) if hasattr(s, "data") else int(s),
+        make_rmem_tensor=lambda shape, dtype=None: _Res(len(shape.data) if hasattr(shape, "data") else int(shape)),
+    )
+    fa_utils = types.SimpleNamespace(shr_u32=lambda w, s: _U32(int(w) >> int(s)))
+    return cutlass, cute, fa_utils
+
+
+@pytest.mark.cpu
+def test_fa4_vector_mask_matches_predicate_and_fallback_on_cpu() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_fa4 import _build_mask_mod
+
+    # The toy layout has runs far shorter than 32, so most 32-key vectors span a
+    # run boundary and take the per-key fallback; the padding tail is one long
+    # run that takes the uniform-run fast path. Both must agree with the exact
+    # predicate, lane for lane.
+    layout = _layout(backend="fa4")
+    metadata, sparsity = _fa4_metadata_and_sparsity(layout, real_und_len=5)
+    q_word_base = sparsity.q_word_base.tolist()
+    k_group_ids = sparsity.k_group_ids.tolist()
+    allowed_words = sparsity.allowed_words.tolist()
+    aux = (q_word_base, k_group_ids, allowed_words)
+
+    cutlass, cute, fa_utils = _cute_cpu_stubs()
+    vector_cb = _build_mask_mod(cutlass, cute, fa_utils, vec_size=32)
+    scalar_cb = _build_mask_mod(cutlass, cute, fa_utils, vec_size=1)
+
+    kv_len = len(k_group_ids)
+    q_len = metadata.q_len
+    assert kv_len % 32 == 0
+    saw_fast_path = False
+    saw_fallback = False
+    # Exhaustive over query rows is O(q_len * kv_len); sample rows that cover the
+    # UND prefix, each item boundary, and padding, which is where runs change.
+    q_rows = sorted(set(range(0, q_len, 7)) | {0, q_len - 1})
+    for q in q_rows:
+        reference = multiview_pair_predicate(
+            metadata, torch.tensor(q), torch.arange(kv_len)
+        ).tolist()
+        for start in range(0, kv_len, 32):
+            n_idx = _Vec(list(range(start, start + 32)))
+            m_idx = _Vec([q])
+            packed = int(vector_cb(0, 0, m_idx, n_idx, None, aux))
+            if int(k_group_ids[start]) == int(k_group_ids[start + 31]):
+                saw_fast_path = True
+            else:
+                saw_fallback = True
+            scalar = scalar_cb(0, 0, m_idx, n_idx, None, aux)
+            for lane in range(32):
+                bit = (packed >> lane) & 1
+                assert bool(bit) == bool(scalar[lane]), (q, start, lane)
+                assert bool(bit) == bool(reference[start + lane]), (q, start, lane)
+    assert saw_fast_path, "fast path (uniform run) was never exercised"
+    assert saw_fallback, "fallback (mixed run) was never exercised"
