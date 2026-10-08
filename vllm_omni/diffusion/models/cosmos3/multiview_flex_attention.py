@@ -466,23 +466,79 @@ def _block_indices(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return counts, indices.to(torch.int32)
 
 
+def _pack_bit_rows(rows: torch.Tensor) -> torch.Tensor:
+    """Pack a ``[row, column]`` boolean table into little-endian int32 bit words.
+
+    The column count must already be a multiple of 32.  Words hold the unsigned
+    32-bit pattern stored in ``int32``, which is what the CuTe kernel
+    reinterprets.
+    """
+    num_rows, num_columns = rows.shape
+    weights = torch.arange(32, device=rows.device, dtype=torch.int64)
+    words = (rows.view(num_rows, num_columns // 32, 32).to(torch.int64) << weights).sum(-1)
+    return torch.where(words >= 2**31, words - 2**32, words).to(torch.int32)
+
+
 def _pack_allowed_bits(group_allowed: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Pack the ``[q_group, k_group]`` truth table into int32 bit words.
 
     The kernel-side mask_mod reads one word and tests one bit, so the whole
     visibility rule set collapses to a few hundred bytes that stay resident in
     cache.  Bit ``g_k`` of word ``g_q * words_per_row + g_k // 32`` is the
-    answer for that group pair.  Words hold the unsigned 32-bit pattern stored
-    in ``int32``, which is what the CuTe kernel reinterprets.
+    answer for that group pair.
     """
     num_q_groups, num_k_groups = group_allowed.shape
     words_per_row = (num_k_groups + 31) // 32
     padded = group_allowed.new_zeros((num_q_groups, words_per_row * 32))
     padded[:, :num_k_groups] = group_allowed
-    weights = torch.arange(32, device=group_allowed.device, dtype=torch.int64)
-    words = (padded.view(num_q_groups, words_per_row, 32).to(torch.int64) << weights).sum(-1)
-    words = torch.where(words >= 2**31, words - 2**32, words)
-    return words.reshape(-1).to(torch.int32).contiguous(), words_per_row
+    return _pack_bit_rows(padded).reshape(-1).contiguous(), words_per_row
+
+
+# Expanding the truth table's key axis from semantic runs to individual tokens
+# costs ``num_q_runs * kv_len / 8`` bytes.  At the released 11-view geometry that
+# is ~65 MiB against ~5 GiB of packed q/k/v, but it grows with both the clip
+# length and the resolution, so cap it and keep the run-indexed table beyond the
+# cap rather than trading an unbounded allocation for the lookup.
+MAX_TOKEN_ALLOWED_TABLE_BYTES = 512 * 1024 * 1024
+
+
+def _pack_token_allowed_bits(
+    group_allowed: torch.Tensor,
+    k_group_ids: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Expand the truth table's key axis from semantic runs to single tokens.
+
+    The run-indexed table needs two dependent loads per key -- the token's run
+    id, then the table word that run's bit lives in -- and the second address
+    differs per lane, so a 32-lane mask_mod call issues 64 serialized loads.
+    Re-keying the columns by token makes the answer for 32 consecutive tokens
+    *one* word, which the kernel can read once and return (see
+    ``multiview_fa4._build_mask_mod``).  Bit ``t`` of word
+    ``g_q * words_per_row + t // 32`` is the answer for query run ``g_q`` and
+    key token ``t``, so the packed bits are the same predicate, only indexed
+    differently.
+
+    Returns ``(words, words_per_row)``, or ``(None, 0)`` when the expansion
+    would exceed ``MAX_TOKEN_ALLOWED_TABLE_BYTES``.
+    """
+    num_q_groups = group_allowed.shape[0]
+    kv_len = int(k_group_ids.numel())
+    words_per_row = (kv_len + 31) // 32
+    if num_q_groups * words_per_row * 4 > MAX_TOKEN_ALLOWED_TABLE_BYTES:
+        return None, 0
+
+    words = group_allowed.new_empty((num_q_groups, words_per_row), dtype=torch.int32)
+    # Gather the columns in word-aligned slabs: the fully expanded boolean table
+    # would be 32x the packed one, which is exactly what this packing avoids.
+    columns = k_group_ids.to(torch.int64)
+    slab_words = max(1, 2**22 // max(1, num_q_groups))
+    for start in range(0, words_per_row, slab_words):
+        end = min(start + slab_words, words_per_row)
+        slab = group_allowed.new_zeros((num_q_groups, (end - start) * 32))
+        available = min(end * 32, kv_len) - start * 32
+        slab[:, :available] = group_allowed[:, columns[start * 32 : start * 32 + available]]
+        words[:, start:end] = _pack_bit_rows(slab)
+    return words.reshape(-1).contiguous(), words_per_row
 
 
 # eq=False: the fields are tensors, so a generated __eq__ would return a tensor
@@ -511,6 +567,12 @@ class MultiviewBlockSparsity:
     q_block_size: int
     kv_block_size: int
     metadata: MultiviewFlexMetadata
+    #: Same predicate as ``allowed_words`` with the key axis re-keyed from
+    #: semantic runs to single tokens, so 32 consecutive keys share one word.
+    #: ``None`` when the expansion would exceed
+    #: ``MAX_TOKEN_ALLOWED_TABLE_BYTES``; the run-indexed table always works.
+    token_allowed_words: torch.Tensor | None = None
+    token_q_word_base: torch.Tensor | None = None
 
     @property
     def q_len(self) -> int:
@@ -521,8 +583,20 @@ class MultiviewBlockSparsity:
         return self.metadata.kv_len
 
     def aux_tensors(self) -> list[torch.Tensor]:
-        """The mask_mod auxiliary tensors, in the order the kernel indexes them."""
-        return [self.q_word_base, self.k_group_ids, self.allowed_words]
+        """The mask_mod auxiliary tensors, in the order the kernel indexes them.
+
+        Both tables answer the same predicate; the key map is what distinguishes
+        them. The run-indexed table needs one, because a key's column is the id
+        of the semantic run it belongs to. The token-indexed table is keyed by
+        token, so a key's column is its own index and the map would be the
+        identity -- it is left empty instead, both to save the redundant gather
+        and because its emptiness is what selects the matching callback (see
+        ``multiview_fa4._build_mask_mod`` and ``_pack_token_allowed_bits``).
+        """
+        if self.token_allowed_words is None:
+            return [self.q_word_base, self.k_group_ids, self.allowed_words]
+        empty = self.k_group_ids.new_empty(0)
+        return [self.token_q_word_base, empty, self.token_allowed_words]
 
     def to_block_mask(self) -> BlockMask:
         metadata = self.metadata
@@ -597,6 +671,12 @@ def build_multiview_block_sparsity(
     # compile-time shape constant and one compiled mask_mod serves every layout.
     allowed_words, words_per_row = _pack_allowed_bits(group_allowed)
     q_word_base = (q_group_ids * words_per_row).to(torch.int32).contiguous()
+    token_allowed_words, token_words_per_row = _pack_token_allowed_bits(group_allowed, k_group_ids)
+    token_q_word_base = (
+        None
+        if token_allowed_words is None
+        else (q_group_ids * token_words_per_row).to(torch.int32).contiguous()
+    )
 
     return MultiviewBlockSparsity(
         partial_counts=partial_counts,
@@ -611,6 +691,8 @@ def build_multiview_block_sparsity(
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
         metadata=metadata,
+        token_allowed_words=token_allowed_words,
+        token_q_word_base=token_q_word_base,
     )
 
 

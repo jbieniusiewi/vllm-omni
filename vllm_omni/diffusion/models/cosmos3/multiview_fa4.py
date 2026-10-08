@@ -26,13 +26,31 @@ class _Fa4Entry(NamedTuple):
     vector_mask_mod: Any
 
 
-def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1):
-    """Read q word offsets, k run IDs, and the truth table from aux_tensors.
+class _TokenMaskMods(NamedTuple):
+    mask_mod: Any
+    vector_mask_mod: Any
+
+
+def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1, token_indexed: bool = False):
+    """Read q word offsets, k column IDs, and the truth table from aux_tensors.
 
     Offsets include the truth table's row stride so kernels work across layouts.
     FA4 wraps aux indices modulo sequence lengths and masks padded lanes, so
     the token maps must cover those lengths exactly. Scalar callbacks return
     Boolean predicates; SM100/SM110 vector callbacks return packed Uint32 bits.
+
+    ``token_indexed`` selects which of the two equivalent tables this callback
+    reads (see ``MultiviewBlockSparsity.aux_tensors``):
+
+    * run-indexed (default): a key's table column is the id of the semantic run
+      it belongs to, so each lane costs two dependent loads -- the run id, then
+      the word holding that run's bit.  A 32-lane call issues 64 serialized
+      loads from addresses that differ per lane.
+    * token-indexed: a key's column is its own index, so ``vec_size``
+      consecutive keys starting on a word boundary have their keep bits in one
+      word, already in lane order.  That word *is* the packed result, so the
+      whole call becomes a single load with no key map to gather.  Lanes that
+      are not such a run fall back to a per-lane loop over the same table.
     """
     if vec_size not in (1, 8, 32):
         raise ValueError(f"Cosmos3 multiview FA4 mask vector size must be 1, 8, or 32, got {vec_size}.")
@@ -57,19 +75,39 @@ def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1):
             result = cute.make_rmem_tensor(n_idx.shape, dtype=cutlass.Boolean)
         else:
             result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
-            result[0] = cutlass.Uint32(0)
-        for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
-            group_k = k_group_ids[n_idx[j]]
-            # Run ids are non-negative, so the unsigned read is lossless and lets
-            # the divide and modulo reduce to one shift each.
-            group_u = cutlass.Uint32(group_k)
-            word = allowed_words[base + cutlass.Int32(group_u // cutlass.Uint32(32))]
-            shift = group_u % cutlass.Uint32(32)
-            keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
-            if cutlass.const_expr(vec_size == 1):
-                result[j] = cutlass.Boolean(keep)
+        if cutlass.const_expr(token_indexed and vec_size >= 32):
+            first = n_idx[0]
+            # A word-aligned run of consecutive keys needs no per-lane work.
+            if (first & cutlass.Int32(31)) == cutlass.Int32(0) and n_idx[vec_size - 1] == first + cutlass.Int32(
+                vec_size - 1
+            ):
+                result[0] = cutlass.Uint32(allowed_words[base + (first >> cutlass.Int32(5))])
             else:
-                result[0] = result[0] | (keep << cutlass.Uint32(j))
+                result[0] = cutlass.Uint32(0)
+                for j in cutlass.range_constexpr(vec_size):
+                    column = n_idx[j]
+                    word = allowed_words[base + (column >> cutlass.Int32(5))]
+                    shift = cutlass.Uint32(column & cutlass.Int32(31))
+                    keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
+                    result[0] = result[0] | (keep << cutlass.Uint32(j))
+        else:
+            if cutlass.const_expr(vec_size != 1):
+                result[0] = cutlass.Uint32(0)
+            for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
+                if cutlass.const_expr(token_indexed):
+                    column = n_idx[j]
+                else:
+                    column = k_group_ids[n_idx[j]]
+                # Column ids are non-negative, so the unsigned read is lossless and
+                # lets the divide and modulo reduce to one shift each.
+                column_u = cutlass.Uint32(column)
+                word = allowed_words[base + cutlass.Int32(column_u // cutlass.Uint32(32))]
+                shift = column_u % cutlass.Uint32(32)
+                keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
+                if cutlass.const_expr(vec_size == 1):
+                    result[j] = cutlass.Boolean(keep)
+                else:
+                    result[0] = result[0] | (keep << cutlass.Uint32(j))
         return result.load()
 
     # FA4 includes this attribute in the compile-cache key as well as using it
@@ -103,6 +141,23 @@ def _load_fa4() -> _Fa4Entry:
     return entry
 
 
+@cache
+def _load_token_mask_mods() -> _TokenMaskMods:
+    """Compile the callbacks that read a token-indexed table; see ``_build_mask_mod``.
+
+    Kept out of ``_load_fa4`` so a layout whose table exceeds
+    ``MAX_TOKEN_ALLOWED_TABLE_BYTES`` never pays for compiling them.
+    """
+    import cutlass
+    import cutlass.cute as cute
+    from vllm.vllm_flash_attn.cute import utils as fa_utils
+
+    return _TokenMaskMods(
+        mask_mod=_build_mask_mod(cutlass, cute, fa_utils, token_indexed=True),
+        vector_mask_mod=_build_mask_mod(cutlass, cute, fa_utils, vec_size=32, token_indexed=True),
+    )
+
+
 def _validate_sparsity(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -115,6 +170,8 @@ def _validate_sparsity(
             f"({FA4_SPARSE_Q_BLOCK_SIZE}, {FA4_SPARSE_KV_BLOCK_SIZE}) sparse block map, got "
             f"({sparsity.q_block_size}, {sparsity.kv_block_size})."
         )
+    # Check the run-indexed maps: they cover the padded lengths whichever table
+    # the launch ends up reading, so this stays one contract for both.
     for name, tensor, token_map, length in (
         ("query", q, sparsity.q_word_base, sparsity.q_len),
         ("key", k, sparsity.k_group_ids, sparsity.kv_len),
@@ -147,9 +204,12 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
     ) -> torch.Tensor:
         """Rebuild FA4's inputs from the tensors/ints allowed in an op schema."""
         entry = _load_fa4()
+        # An empty key map means allowed_words is keyed by token rather than by
+        # semantic run, which the matching callbacks read directly.
+        mods = _load_token_mask_mods() if k_group_ids.numel() == 0 else entry
         # Only SM100/SM110 implement vector callbacks; resolve inside the op.
         mask_mod = (
-            entry.vector_mask_mod if torch.cuda.get_device_capability(q.device)[0] in (10, 11) else entry.mask_mod
+            mods.vector_mask_mod if torch.cuda.get_device_capability(q.device)[0] in (10, 11) else mods.mask_mod
         )
         # Broadcast the shared mask over batch and heads, preserving GQA packing.
         block_sparse = entry.block_sparse_cls(
@@ -190,6 +250,9 @@ def multiview_fa4_attention(
     """
     _validate_sparsity(q, k, sparsity)
 
+    # Both mask tables answer the same predicate; the sparsity picks whichever
+    # the kernel can read fastest. The op schema is unchanged either way.
+    q_word_base, k_group_ids, allowed_words = sparsity.aux_tensors()
     return _cosmos3_multiview_fa4_op(
         q,
         k,
@@ -198,9 +261,9 @@ def multiview_fa4_attention(
         sparsity.partial_indices,
         sparsity.full_counts,
         sparsity.full_indices,
-        sparsity.q_word_base,
-        sparsity.k_group_ids,
-        sparsity.allowed_words,
+        q_word_base,
+        k_group_ids,
+        allowed_words,
         sparsity.q_block_size,
         sparsity.kv_block_size,
     )

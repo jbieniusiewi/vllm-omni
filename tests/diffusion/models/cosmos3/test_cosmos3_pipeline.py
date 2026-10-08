@@ -3567,7 +3567,7 @@ def test_multiview_fa4_loads_vllm_bundled_flash_attn(monkeypatch: pytest.MonkeyP
 
 
 def _fa4_test_sparsity() -> SimpleNamespace:
-    return SimpleNamespace(
+    sparsity = SimpleNamespace(
         partial_counts=torch.ones(1, dtype=torch.int32),
         partial_indices=torch.zeros(1, 1, dtype=torch.int32),
         full_counts=torch.zeros(1, dtype=torch.int32),
@@ -3580,6 +3580,10 @@ def _fa4_test_sparsity() -> SimpleNamespace:
         q_len=256,
         kv_len=128,
     )
+    # This stands in for the run-indexed table, which the real sparsity reports
+    # whenever it did not build the token-indexed one.
+    sparsity.aux_tensors = lambda: [sparsity.q_word_base, sparsity.k_group_ids, sparsity.allowed_words]
+    return sparsity
 
 
 @pytest.mark.parametrize(
