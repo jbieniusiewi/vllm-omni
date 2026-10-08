@@ -69,6 +69,11 @@ _BACKEND_BLOCK_SIZES: dict[str, tuple[int, int]] = {
 # ``vision_start`` framing tokens the tokenizer appends after truncating.
 DEFAULT_MAX_UND_TOKENS = 4096 + 2
 
+# Query runs expanded per ``_pack_allowed_bitmap`` call, as a budget on the
+# intermediate's element count rather than on the run count, so the temporary
+# stays the same size whatever the request's key length is.
+_BITMAP_BUILD_ROWS = 1 << 27
+
 MULTIVIEW_BACKENDS: tuple[str, ...] = tuple(sorted(_BACKEND_BLOCK_SIZES))
 
 
@@ -466,6 +471,36 @@ def _block_indices(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return counts, indices.to(torch.int32)
 
 
+def _pack_allowed_bitmap(group_allowed: torch.Tensor, k_group_ids: torch.Tensor) -> torch.Tensor:
+    """Expand the run-pair table into one keep-bit per ``[q_group, key token]``.
+
+    ``_pack_allowed_bits`` keeps the table at run granularity, so the kernel-side
+    mask_mod resolves a key with two dependent loads (the key's run id, then its
+    word in the table) plus a divide and modulo, once per KV lane.  Projecting the
+    same answers onto key tokens up front replaces that with a single load: the
+    32 keys of an aligned chunk are exactly the 32 bits of word
+    ``q_group * words_per_row + token // 32``.
+
+    The bits are the same predicate values ``_pack_allowed_bits`` encodes, just
+    indexed by token instead of by run, so the resolved mask is identical.
+    """
+    num_q_groups = group_allowed.shape[0]
+    kv_len = k_group_ids.numel()
+    if kv_len % 32:
+        raise ValueError(f"Cosmos3 multiview key length {kv_len} is not a multiple of the 32-bit mask word.")
+    words_per_row = kv_len // 32
+    weights = torch.arange(32, device=group_allowed.device, dtype=torch.int64)
+    bitmap = torch.empty((num_q_groups, words_per_row), dtype=torch.int32, device=group_allowed.device)
+    # Chunk over query runs: the full [q_group, key token] expansion would be
+    # tens of GiB, while one chunk's rows are the size of the key sequence.
+    chunk = max(1, _BITMAP_BUILD_ROWS // max(1, words_per_row))
+    for start in range(0, num_q_groups, chunk):
+        rows = group_allowed[start : start + chunk].index_select(1, k_group_ids)
+        words = (rows.view(rows.shape[0], words_per_row, 32).to(torch.int64) << weights).sum(-1)
+        bitmap[start : start + chunk] = torch.where(words >= 2**31, words - 2**32, words).to(torch.int32)
+    return bitmap
+
+
 def _pack_allowed_bits(group_allowed: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Pack the ``[q_group, k_group]`` truth table into int32 bit words.
 
@@ -511,6 +546,13 @@ class MultiviewBlockSparsity:
     q_block_size: int
     kv_block_size: int
     metadata: MultiviewFlexMetadata
+    #: Per-key-token keep bits, built only for the FA4 backend. See
+    #: ``_pack_allowed_bitmap``; ``None`` on the Triton path, which resolves
+    #: partial tiles through ``mask_mod`` instead.
+    token_bitmap: torch.Tensor | None = None
+    #: ``q_token -> flat word offset`` for ``token_bitmap``, folding its row
+    #: stride in exactly as ``q_word_base`` does for ``allowed_words``.
+    token_base: torch.Tensor | None = None
 
     @property
     def q_len(self) -> int:
@@ -522,7 +564,9 @@ class MultiviewBlockSparsity:
 
     def aux_tensors(self) -> list[torch.Tensor]:
         """The mask_mod auxiliary tensors, in the order the kernel indexes them."""
-        return [self.q_word_base, self.k_group_ids, self.allowed_words]
+        if self.token_bitmap is None or self.token_base is None:
+            return [self.q_word_base, self.k_group_ids, self.allowed_words]
+        return [self.token_base, self.token_bitmap]
 
     def to_block_mask(self) -> BlockMask:
         metadata = self.metadata
@@ -555,6 +599,7 @@ def build_multiview_block_sparsity(
     *,
     q_block_size: int = SPARSE_Q_BLOCK_SIZE,
     kv_block_size: int = SPARSE_KV_BLOCK_SIZE,
+    build_token_bitmap: bool = False,
 ) -> MultiviewBlockSparsity:
     """Compress semantic runs into a sparse block map and a mask lookup table.
 
@@ -598,6 +643,18 @@ def build_multiview_block_sparsity(
     allowed_words, words_per_row = _pack_allowed_bits(group_allowed)
     q_word_base = (q_group_ids * words_per_row).to(torch.int32).contiguous()
 
+    # The per-token bitmap answers a key in one load where the run table needs
+    # two dependent loads plus a divide; it costs one word per 32 keys per query
+    # run, which is small next to the packed q/k/v. It is only worth building
+    # where a kernel-side callback resolves partial tiles per element, i.e. FA4;
+    # the Triton path traces ``mask_mod`` from the run vectors instead.
+    token_bitmap = None
+    token_base = None
+    if build_token_bitmap:
+        token_bitmap = _pack_allowed_bitmap(group_allowed, k_group_ids)
+        token_base = (q_group_ids * token_bitmap.shape[1]).to(torch.int32).contiguous()
+        token_bitmap = token_bitmap.reshape(-1).contiguous()
+
     return MultiviewBlockSparsity(
         partial_counts=partial_counts,
         partial_indices=partial_indices,
@@ -608,6 +665,8 @@ def build_multiview_block_sparsity(
         allowed_words=allowed_words,
         group_allowed=group_allowed,
         words_per_row=words_per_row,
+        token_bitmap=token_bitmap,
+        token_base=token_base,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
         metadata=metadata,
@@ -661,6 +720,7 @@ def get_multiview_attention_plan(
         metadata,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
+        build_token_bitmap=layout.backend == "fa4",
     )
     plan = sparsity if layout.backend == "fa4" else sparsity.to_block_mask()
     context.mask_cache[key] = plan

@@ -24,6 +24,49 @@ class _Fa4Entry(NamedTuple):
     block_sparse_cls: Any
     mask_mod: Any
     vector_mask_mod: Any
+    bitmap_mask_mod: Any
+
+
+def _build_bitmap_mask_mod(cutlass, cute, fa_utils):
+    """Resolve 32 adjacent keys from one word of the per-token keep bitmap.
+
+    ``_build_mask_mod`` answers each KV lane with two dependent global loads
+    (the key's semantic run id, then that run's word in the truth table) plus a
+    divide and a modulo.  FA4 hands the vector callback 32 *consecutive* keys of
+    one 128-wide KV tile, and the host side has already projected the same truth
+    table onto key tokens, so an aligned chunk of 32 keys is exactly the 32 bits
+    of one word -- one load, no arithmetic per lane, and the packed Uint32 the
+    vector ABI wants is the word itself.
+
+    Lane ``j`` of the call is key ``n_idx[0] + j``, so the word index is
+    ``token_base[q] + n_idx[0] // 32``.  The host guarantees alignment: the KV
+    block size is 128 and the bitmap covers the padded key length exactly.
+    """
+
+    @cute.jit
+    def multiview_bitmap_mask_mod(
+        batch: Any,
+        head: Any,
+        m_idx: Any,
+        n_idx: Any,
+        seqlen_info: Any,
+        aux_tensors: Any,
+    ) -> Any:
+        token_base = aux_tensors[0]
+        token_bitmap = aux_tensors[1]
+
+        # FA4 broadcasts one logical query row across the vector, including when
+        # GQA packs several heads into the physical query tile.
+        base = token_base[m_idx[0]]
+        # Key indices are non-negative, so the unsigned shift is lossless and the
+        # division by the 32-bit word width reduces to one shift.
+        first = cutlass.Uint32(n_idx[0])
+        result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+        result[0] = cutlass.Uint32(token_bitmap[base + cutlass.Int32(fa_utils.shr_u32(first, cutlass.Uint32(5)))])
+        return result.load()
+
+    multiview_bitmap_mask_mod.__vec_size__ = 32
+    return multiview_bitmap_mask_mod
 
 
 def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1):
@@ -98,6 +141,7 @@ def _load_fa4() -> _Fa4Entry:
         block_sparse_cls=BlockSparseTensorsTorch,
         mask_mod=_build_mask_mod(cutlass, cute, fa_utils),
         vector_mask_mod=_build_mask_mod(cutlass, cute, fa_utils, vec_size=32),
+        bitmap_mask_mod=_build_bitmap_mask_mod(cutlass, cute, fa_utils),
     )
     logger.info("Cosmos3 multiview attention using the FlashAttention-4 CuTe backend.")
     return entry
@@ -139,18 +183,20 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
         partial_indices: torch.Tensor,
         full_counts: torch.Tensor,
         full_indices: torch.Tensor,
-        q_word_base: torch.Tensor,
-        k_group_ids: torch.Tensor,
-        allowed_words: torch.Tensor,
+        aux_tensors: list[torch.Tensor],
         q_block_size: int,
         kv_block_size: int,
+        bitmap_mask: bool,
     ) -> torch.Tensor:
         """Rebuild FA4's inputs from the tensors/ints allowed in an op schema."""
         entry = _load_fa4()
         # Only SM100/SM110 implement vector callbacks; resolve inside the op.
-        mask_mod = (
-            entry.vector_mask_mod if torch.cuda.get_device_capability(q.device)[0] in (10, 11) else entry.mask_mod
-        )
+        if bitmap_mask:
+            mask_mod = entry.bitmap_mask_mod
+        elif torch.cuda.get_device_capability(q.device)[0] in (10, 11):
+            mask_mod = entry.vector_mask_mod
+        else:
+            mask_mod = entry.mask_mod
         # Broadcast the shared mask over batch and heads, preserving GQA packing.
         block_sparse = entry.block_sparse_cls(
             mask_block_cnt=partial_counts[None, None],
@@ -164,7 +210,7 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
             k,
             v,
             mask_mod=mask_mod,
-            aux_tensors=[q_word_base, k_group_ids, allowed_words],
+            aux_tensors=list(aux_tensors),
             block_sparse_tensors=block_sparse,
         )
         return out.contiguous()
@@ -190,6 +236,20 @@ def multiview_fa4_attention(
     """
     _validate_sparsity(q, k, sparsity)
 
+    # The per-token bitmap and the run table encode the same predicate; the
+    # bitmap resolves it in one load, so prefer it when the host built one. Its
+    # packed-Uint32 return is the vector callback ABI, which only SM100/SM110
+    # implement, so older devices keep the per-element run-table callback.
+    bitmap_mask = (
+        sparsity.token_bitmap is not None
+        and sparsity.token_base is not None
+        and torch.cuda.get_device_capability(q.device)[0] in (10, 11)
+    )
+    aux = (
+        [sparsity.token_base, sparsity.token_bitmap]
+        if bitmap_mask
+        else [sparsity.q_word_base, sparsity.k_group_ids, sparsity.allowed_words]
+    )
     return _cosmos3_multiview_fa4_op(
         q,
         k,
@@ -198,9 +258,8 @@ def multiview_fa4_attention(
         sparsity.partial_indices,
         sparsity.full_counts,
         sparsity.full_indices,
-        sparsity.q_word_base,
-        sparsity.k_group_ids,
-        sparsity.allowed_words,
+        aux,
         sparsity.q_block_size,
         sparsity.kv_block_size,
+        bitmap_mask,
     )
