@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -126,6 +127,39 @@ def _normalize_local_condition_indexes(value: Any) -> list[int]:
     else:
         raise TypeError("Cosmos3 multiview condition_frame_indexes_vision must be an int, list, or CSV string.")
     return sorted({int(index) for index in values})
+
+
+# Each in-flight camera prepare holds its decoded clip plus the FP32 resize
+# intermediate, which is gigabytes at WSM resolutions, so concurrency is capped
+# by host memory as well as by cores. Four covers the decode/resize overlap --
+# the serial decodes are what the overlap hides -- without a footprint that
+# scales with the camera count.
+_CAMERA_PREPARE_MAX_WORKERS = 4
+
+
+def _run_camera_prepare_jobs(prepare: Callable[[int], None], count: int) -> None:
+    """Run ``prepare(index)`` for every camera, overlapping independent views.
+
+    Each call writes its own slot and shares no state, so the results do not
+    depend on the order the views complete in; the caller reassembles them by
+    index. Falls back to running inline when there is nothing to overlap, and
+    propagates the first failure after cancelling the rest so a bad clip is
+    still reported rather than leaving threads running.
+    """
+    workers = min(count, _CAMERA_PREPARE_MAX_WORKERS, os.cpu_count() or 1)
+    if workers <= 1:
+        for index in range(count):
+            prepare(index)
+        return
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="multiview-prepare") as executor:
+        futures = [executor.submit(prepare, index) for index in range(count)]
+        try:
+            for future in futures:
+                future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
 
 
 def _pad_multiview_view_video(
@@ -544,13 +578,21 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        # One camera's prepare is independent of every other's, and each is a
+        # serial ffmpeg decode followed by a resize that leaves most cores idle
+        # while the GPU has nothing queued at all. Overlapping the cameras hides
+        # the decodes behind each other's resizes. Per-view results are stored
+        # by index and concatenated in view order below, so the packed layout is
+        # identical to the sequential one.
+        prepared: list[torch.Tensor | None] = [None] * len(views)
+
+        def prepare(index: int) -> None:
+            view = views[index]
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
-                    continue
+                    prepared[index] = torch.full((3, num_frames, height, width), 128, dtype=torch.uint8)
+                    return
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(
                 value,
@@ -562,7 +604,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError(
                     f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
+            prepared[index] = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+
+        _run_camera_prepare_jobs(prepare, len(views))
+        if any(part is None for part in prepared):
+            raise RuntimeError("Cosmos3 multiview camera preparation did not produce every view.")
         camera_major = torch.cat(prepared, dim=1)
         return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
 
