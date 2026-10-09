@@ -3790,8 +3790,7 @@ def test_multiview_forward_per_view_negative_captions(
     pipeline.multiview_cross_view_past_window_seconds = 0.4
     pipeline.multiview_backend = "triton"
     pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
-    pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
-    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 150, 1, 1)
+    pipeline._prepare_and_encode_camera_major = lambda *args, **kwargs: torch.zeros(1, 2, 150, 1, 1)
     pipeline._prepare_multiview_latents = lambda **kwargs: (
         torch.zeros(1, 2, 150, 1, 1),
         torch.ones(1, 1, 150, 1, 1),
@@ -4127,11 +4126,10 @@ def test_multiview_denoising_state_is_float32_with_bf16_model() -> None:
     pipeline.vae_scale_factor_spatial = 8
     # Two cameras with two latent frames each; latent frame 0 of each camera is conditioned.
     encoded = torch.full((1, 2, 4, 2, 2), 0.3, dtype=torch.bfloat16)
-    pipeline._encode_multiview_video = lambda video, **kwargs: encoded
     # 1 + 2**-12 rounds to 1 in BF16; injected reference noise must survive unrounded.
     injected = torch.full((1, 2, 4, 2, 2), 1.0 + 2**-12)
     prepare = dict(
-        target_pixels=torch.zeros(1),
+        target_latents=encoded,
         condition_indexes=[0, 2],
         num_views=2,
         num_frames=5,
