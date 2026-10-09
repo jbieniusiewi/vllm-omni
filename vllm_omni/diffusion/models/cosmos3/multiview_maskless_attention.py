@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from .multiview_flex_attention import MultiviewAttentionContext
+from .multiview_maskless_merge import fused_merge, fused_merge_supported
 from .multiview_maskless_plan import (
     META_GEN_TOKENS,
     META_IDENTITY_K,
@@ -198,6 +199,14 @@ def _merge_step_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, t
     return _compiled_merge_step
 
 
+def _planned_pass_rows(plan: list[torch.Tensor], num_passes: int) -> list[int]:
+    """Query rows each pass merges, read from the plan's index tensor shapes.
+
+    Shapes are static metadata, so this needs no device synchronization.
+    """
+    return [plan[index * TENSORS_PER_PASS].numel() for index in range(num_passes)]
+
+
 def _maskless_attention_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -228,6 +237,22 @@ def _maskless_attention_impl(
     heads, head_dim = q.shape[2], q.shape[3]
     kernel = get_pass_kernel(kernel_name)
     merge = _merge_step_for(q.device)
+    # The merge folds every pass into one FP32 accumulator over all GEN rows.
+    # Walking the passes one at a time gathers and scatters that accumulator
+    # per pass, which at production geometries moves several GiB more than the
+    # arithmetic needs.  When the fused kernel can run this geometry, retain
+    # the pass outputs instead and merge them in registers in a single launch
+    # -- same operations in the same order, so the result is bit-identical.
+    pass_rows = _planned_pass_rows(plan, num_passes)
+    fused = fused_merge_supported(
+        device=q.device,
+        heads=heads,
+        head_dim=head_dim,
+        num_passes=num_passes,
+        planned_tokens=planned_tokens,
+        pass_rows=pass_rows,
+        dtype=q.dtype,
+    )
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
     # inference-mode temporaries.
@@ -235,6 +260,9 @@ def _maskless_attention_impl(
     with torch.inference_mode():
         acc: torch.Tensor | None = None
         acc_lse: torch.Tensor | None = None
+        fused_outputs: list[torch.Tensor] = []
+        fused_lses: list[torch.Tensor] = []
+        fused_indices: list[torch.Tensor] = []
         for index in range(num_passes):
             q_index, k_index, cu_seqlens_q, cu_seqlens_k, meta = plan[
                 index * TENSORS_PER_PASS : (index + 1) * TENSORS_PER_PASS
@@ -266,6 +294,13 @@ def _maskless_attention_impl(
                     f"Maskless pass kernel returned output {tuple(out.shape)} and LSE {tuple(lse.shape)} "
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
+            if fused:
+                # Hold this pass for the single fused launch below. The pass
+                # kernel already owns these buffers, so nothing is copied.
+                fused_outputs.append(out)
+                fused_lses.append(lse)
+                fused_indices.append(q_index)
+                continue
             if acc is None:
                 # The same-view pass covers every row and seeds the accumulators.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
@@ -293,6 +328,17 @@ def _maskless_attention_impl(
                         acc.index_copy_(0, gather, merged)
                         acc_lse.index_copy_(0, gather, merged_lse)
             del out, lse
+        if fused:
+            fused_merge(
+                result[0],
+                fused_outputs,
+                fused_lses,
+                fused_indices,
+                planned_tokens=planned_tokens,
+                heads=heads,
+                head_dim=head_dim,
+            )
+            return result
         assert acc is not None
         for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
             chunk = slice(start, start + MERGE_CHUNK_SIZE)

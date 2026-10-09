@@ -179,6 +179,12 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         super().reset_cache()
         self._multiview_mask_cache.clear()
         self._multiview_buffer_cache.clear()
+        # The maskless merge caches one inverse permutation per plan index
+        # tensor and keeps that tensor alive; the plans live in the mask cache
+        # just dropped, so release the inverses with them.
+        from .multiview_maskless_merge import reset_inverse_cache
+
+        reset_inverse_cache()
 
     def validate_loaded_weights(self, loaded: set[str]) -> None:
         super().validate_loaded_weights(loaded)
