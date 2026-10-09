@@ -18,6 +18,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     DupUp3D,
     WanCausalConv3d,
     WanDecoder3d,
+    WanEncoder3d,
     WanResample,
     WanResidualBlock,
     WanResidualUpBlock,
@@ -146,9 +147,28 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
         return _skip(level, f"vae_parallel_mode={parallel_mode!r} is not supported")
 
     modules = [(f"decoder.{name}" if name else "decoder", module) for name, module in decoder.named_modules()]
-    post_quant_conv = getattr(vae, "post_quant_conv", None)
-    if type(post_quant_conv) is WanCausalConv3d:
-        modules.append(("post_quant_conv", post_quant_conv))
+    # The encoder is built from the same ``WanCausalConv3d`` / ``WanRMS_norm`` /
+    # ``WanResidualBlock`` / ``WanResample`` classes as the decoder, and their
+    # replacement forwards are written against those classes, not against a
+    # direction: ``resample_forward`` already carries the ``downsample3d`` branch
+    # the encoder takes. Only ``WanDecoder3d.forward`` itself is decoder-shaped,
+    # and it is keyed by type so the encoder simply never matches it. Binding the
+    # encoder's modules therefore removes the same ``clone`` + ``cat`` + ``F.pad``
+    # copies and fp32 norm round trips from the encode path, which a V2V or
+    # transfer request pays once per conditioning clip.
+    encoder = getattr(vae, "encoder", None)
+    if type(encoder) is WanEncoder3d:
+        modules += [(f"encoder.{name}" if name else "encoder", module) for name, module in encoder.named_modules()]
+    # ``post_quant_conv``/``quant_conv`` are invoked through ``module.forward``
+    # by ``_decode``/``_encode`` themselves, so they take a real binding; every
+    # other causal convolution is reached only from a replacement forward, which
+    # calls into it directly and therefore bypasses its ``forward``.
+    entry_convs: set[nn.Module] = set()
+    for attribute in ("post_quant_conv", "quant_conv"):
+        conv = getattr(vae, attribute, None)
+        if type(conv) is WanCausalConv3d:
+            modules.append((attribute, conv))
+            entry_convs.add(conv)
     bindings: list[tuple[nn.Module, Callable[..., Any]]] = []
     convs: list[nn.Module] = []
     bypassed: set[nn.Module] = set()
@@ -162,7 +182,7 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
         if isinstance(module, (nn.Conv2d, nn.Conv3d)):
             convs.append(module)
         if type(module) in (WanResample, DupUp3D, nn.SiLU) or (
-            type(module) is WanCausalConv3d and module is not post_quant_conv
+            type(module) is WanCausalConv3d and module not in entry_convs
         ):
             bypassed.add(module)
         if type(module) is WanResample and forwards._is_upsample_conv_pair(module.resample):
