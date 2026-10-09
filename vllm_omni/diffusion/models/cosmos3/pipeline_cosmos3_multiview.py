@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -126,6 +127,73 @@ def _normalize_local_condition_indexes(value: Any) -> list[int]:
     else:
         raise TypeError("Cosmos3 multiview condition_frame_indexes_vision must be an int, list, or CSV string.")
     return sorted({int(index) for index in values})
+
+
+# Each in-flight camera prepare holds its decoded clip plus the FP32 resize
+# intermediate, which is gigabytes at WSM resolutions, so concurrency is capped
+# by host memory as well as by cores. Four covers the decode/resize overlap --
+# the serial decodes are what the overlap hides -- without a footprint that
+# scales with the camera count.
+_CAMERA_PREPARE_MAX_WORKERS = 4
+
+
+def _run_camera_prepare_jobs(prepare: Callable[[int], None], count: int) -> None:
+    """Run ``prepare(index)`` for every camera, overlapping independent views.
+
+    Each call writes its own slot and shares no state, so the results do not
+    depend on the order the views complete in; the caller reassembles them by
+    index. Falls back to running inline when there is nothing to overlap, and
+    propagates the first failure after cancelling the rest so a bad clip is
+    still reported rather than leaving threads running.
+    """
+    workers = min(count, _CAMERA_PREPARE_MAX_WORKERS, os.cpu_count() or 1)
+    if workers <= 1:
+        for index in range(count):
+            prepare(index)
+        return
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="multiview-prepare") as executor:
+        futures = [executor.submit(prepare, index) for index in range(count)]
+        try:
+            for future in futures:
+                future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+
+
+def _run_camera_prepare_pipeline(
+    prepare: Callable[[int], None],
+    consume: Callable[[int], None],
+    count: int,
+) -> None:
+    """Decode cameras concurrently while consuming each one in view order.
+
+    ``prepare(index)`` runs on the same worker pool ``_run_camera_prepare_jobs``
+    uses; ``consume(index)`` runs on the calling thread as soon as that view's
+    prepare has finished, in ascending view order. The decodes still leave the
+    GPU idle individually, but a view's device work now overlaps the host
+    decodes of the views behind it instead of waiting for all of them. Consuming
+    in view order keeps the device call sequence identical to the serial path.
+    Falls back to running inline when there is nothing to overlap, and
+    propagates the first failure after cancelling the rest.
+    """
+    workers = min(count, _CAMERA_PREPARE_MAX_WORKERS, (os.cpu_count() or 1))
+    if workers <= 1:
+        for index in range(count):
+            prepare(index)
+            consume(index)
+        return
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="multiview-prepare") as executor:
+        futures = [executor.submit(prepare, index) for index in range(count)]
+        try:
+            for index, future in enumerate(futures):
+                future.result()
+                consume(index)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
 
 
 def _pad_multiview_view_video(
@@ -533,24 +601,31 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     def _view_value(view: Mapping[str, Any], field: str) -> Any:
         return view.get(f"{field}_path", view.get(field))
 
-    def _prepare_camera_major_pixels(
+    def _camera_prepare_job(
         self,
         views: Sequence[Mapping[str, Any]],
+        prepared: list[torch.Tensor | None],
         *,
         field: str,
         height: int,
         width: int,
         num_frames: int,
         keep_first: bool,
-        require_complete: bool = False,
-    ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        require_complete: bool,
+    ) -> Callable[[int], None]:
+        """Build the per-view host decode, writing ``prepared[index]`` in place.
+
+        One camera's prepare is independent of every other's, so the callers run
+        this over a worker pool; each only ever writes its own slot.
+        """
+
+        def prepare(index: int) -> None:
+            view = views[index]
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
-                    continue
+                    prepared[index] = torch.full((3, num_frames, height, width), 128, dtype=torch.uint8)
+                    return
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(
                 value,
@@ -562,9 +637,98 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError(
                     f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
+            prepared[index] = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+
+        return prepare
+
+    def _prepare_camera_major_pixels(
+        self,
+        views: Sequence[Mapping[str, Any]],
+        *,
+        field: str,
+        height: int,
+        width: int,
+        num_frames: int,
+        keep_first: bool,
+        require_complete: bool = False,
+    ) -> torch.Tensor:
+        # Per-view results are stored by index and concatenated in view order
+        # below, so the packed layout is identical to the sequential one. The
+        # pixels are prepared serially here (the pixel-prep parallelization is a
+        # separate change); the decode/encode overlap lives in
+        # _prepare_and_encode_camera_major, which is the path the generation uses.
+        prepared: list[torch.Tensor | None] = [None] * len(views)
+        prepare = self._camera_prepare_job(
+            views,
+            prepared,
+            field=field,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            keep_first=keep_first,
+            require_complete=require_complete,
+        )
+        for index in range(len(views)):
+            prepare(index)
+        if any(part is None for part in prepared):
+            raise RuntimeError("Cosmos3 multiview camera preparation did not produce every view.")
         camera_major = torch.cat(prepared, dim=1)
         return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
+
+    def _prepare_and_encode_camera_major(
+        self,
+        views: Sequence[Mapping[str, Any]],
+        *,
+        field: str,
+        height: int,
+        width: int,
+        num_frames: int,
+        keep_first: bool,
+        require_complete: bool = False,
+    ) -> torch.Tensor:
+        """Host-decode the cameras and VAE-encode each as soon as it is ready.
+
+        Preparing every camera before encoding any of them leaves the device
+        idle for the whole decode -- at the released 11-camera geometry that is
+        the single largest stretch of the request with no GPU work queued at
+        all. Encoding view ``i`` while the pool still decodes the views behind
+        it hides that device work behind host work that was happening anyway.
+
+        The arithmetic is unchanged: normalization is elementwise, so a view
+        normalized on its own holds the same values as its slice of the packed
+        camera-major tensor, and ``_encode_video_tensor`` is handed one camera
+        clip here exactly as it is on the packed path. Encodes are consumed in
+        view order, so the device sees the same call sequence as before.
+        """
+        prepared: list[torch.Tensor | None] = [None] * len(views)
+        latents: list[torch.Tensor | None] = [None] * len(views)
+        prepare = self._camera_prepare_job(
+            views,
+            prepared,
+            field=field,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            keep_first=keep_first,
+            require_complete=require_complete,
+        )
+
+        def consume(index: int) -> None:
+            frames = prepared[index]
+            if frames is None:
+                raise RuntimeError("Cosmos3 multiview camera preparation did not produce every view.")
+            # Drop the decoded clip as soon as it is encoded: holding every
+            # camera's pixels at once is what the packed path pays for.
+            prepared[index] = None
+            latents[index] = self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype))
+
+        _run_camera_prepare_pipeline(prepare, consume, len(views))
+        if any(latent is None for latent in latents):
+            raise RuntimeError("Cosmos3 multiview camera preparation did not produce every view.")
+        latent_frames = {int(latent.shape[2]) for latent in latents}
+        if len(latent_frames) != 1:
+            raise ValueError(f"Cosmos3 multiview per-camera VAE encodes have unequal lengths: {latent_frames}.")
+        return torch.cat(latents, dim=2)
 
     def _encode_multiview_video(
         self,
@@ -656,7 +820,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     def _prepare_multiview_latents(
         self,
         *,
-        target_pixels: torch.Tensor | None,
+        target_latents: torch.Tensor | None,
         condition_indexes: Sequence[int],
         num_views: int,
         num_frames: int,
@@ -687,13 +851,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         condition_mask = torch.zeros(1, 1, shape[2], 1, 1, device=self.device, dtype=self.sampling_dtype)
         condition_latents = torch.zeros_like(noise)
         if condition_indexes:
-            if target_pixels is None:
+            if target_latents is None:
                 raise ValueError("Cosmos3 multiview condition indexes require per-camera vision inputs.")
-            encoded = self._encode_multiview_video(
-                target_pixels,
-                num_views=num_views,
-                frames_per_view=num_frames,
-            )
+            encoded = target_latents
             if tuple(encoded.shape) != shape:
                 raise ValueError(
                     f"Cosmos3 multiview target VAE latent shape mismatch: expected={shape}, got={tuple(encoded.shape)}."
@@ -774,9 +934,15 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         has_vision = bool(known_views)
         completion = has_vision and len(known_views) < num_views
         vision_kind = _media_kind(self._view_value(views[known_views[0]], "vision")) if has_vision else None
-        target_pixels = None
+        # Each camera is decoded on the host and then VAE-encoded on the device,
+        # and the two are independent across cameras, so they are pipelined: a
+        # camera's encode runs while the pool still decodes the cameras behind
+        # it. Preparing all of them first leaves the device idle for the whole
+        # decode. Only the per-camera latents are retained, never the full
+        # camera-major pixel video.
+        target_latents = None
         if has_vision:
-            target_pixels = self._prepare_camera_major_pixels(
+            target_latents = self._prepare_and_encode_camera_major(
                 views,
                 field="vision",
                 height=height,
@@ -785,8 +951,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 keep_first=condition_video_as_image,
                 require_complete=completion,
             )
-        control_pixels = (
-            self._prepare_camera_major_pixels(
+        control_latents = (
+            self._prepare_and_encode_camera_major(
                 views,
                 field="control",
                 height=height,
@@ -827,7 +993,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             generator = torch.Generator(device=self.device).manual_seed(seed)
         injected_latents = sp.latents if isinstance(sp.latents, torch.Tensor) else None
         latents, velocity_mask, condition_latents = self._prepare_multiview_latents(
-            target_pixels=target_pixels,
+            target_latents=target_latents,
             condition_indexes=condition_indexes,
             num_views=num_views,
             num_frames=num_frames,
@@ -836,16 +1002,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             generator=generator,
             injected_latents=injected_latents,
         )
-        control_latents = (
-            self._encode_multiview_video(
-                control_pixels,
-                num_views=num_views,
-                frames_per_view=num_frames,
-            )
-            if control_pixels is not None
-            else None
-        )
-        del target_pixels, control_pixels
+        del target_latents
         if control_latents is not None and control_latents.shape != latents.shape:
             raise ValueError(
                 "Cosmos3 multiview WSM and target latent shapes must match: "
