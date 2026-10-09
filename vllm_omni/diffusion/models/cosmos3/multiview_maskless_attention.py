@@ -184,18 +184,116 @@ def _merge_attention_outputs(outputs: list[torch.Tensor], lse_tensors: list[torc
     return acc.to(outputs[0].dtype)
 
 
-_compiled_merge_step: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
+def merge_into(acc: torch.Tensor, acc_lse: torch.Tensor, out: torch.Tensor, lse: torch.Tensor) -> None:
+    """``merge_step`` folded into the accumulators in place.
+
+    Same arithmetic in the same order as :func:`merge_step`, so the result is
+    bit-identical.  Writing through the accumulators lets one fused elementwise
+    kernel do the whole fold: the functional form has to materialize its two
+    results and copy them back, which reads and writes the FP32 accumulator
+    twice over.  Both deltas are read off the incoming ``acc_lse`` before
+    either store, so the two in-place updates cannot observe each other.
+    """
+    lse_f = lse.float()
+    weight = torch.sigmoid(lse_f - acc_lse).unsqueeze(-1)
+    delta_lse = F.logsigmoid(acc_lse - lse_f)
+    acc.sub_(weight * (acc - out.float()))
+    acc_lse.sub_(delta_lse)
 
 
-def _merge_step_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
-    # Elementwise over chunk rows: one dynamic-shape graph serves every chunk
-    # length and every geometry.  CPU (tests) runs eager.
+def merge_into_result(
+    result: torch.Tensor, acc: torch.Tensor, acc_lse: torch.Tensor, out: torch.Tensor, lse: torch.Tensor
+) -> None:
+    """Fold the final branch straight into the output, in the caller's dtype.
+
+    The last pass is the only one whose updated LSE nobody reads, and whose
+    accumulator is immediately cast to the output.  Writing the cast value
+    directly retires both the accumulator store and the separate output copy;
+    the rounding is the same single FP32->output conversion either way.
+    """
+    weight = torch.sigmoid(lse.float() - acc_lse).unsqueeze(-1)
+    result.copy_(acc - weight * (acc - out.float()))
+
+
+def merge_into_gathered(
+    acc: torch.Tensor,
+    acc_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    inverse: torch.Tensor,
+) -> None:
+    """``merge_into`` for a pass that permutes the rows it covers.
+
+    ``inverse`` is the inverse of the pass's ``q_index``, so row ``g`` of the
+    accumulator folds in row ``inverse[g]`` of the pass -- the same pairing
+    ``q_index`` expresses, read from the other side.  Gathering the pass output
+    instead of the accumulator keeps the accumulator traffic sequential and
+    leaves only one indexed read, over the smaller branch tensors.
+    """
+    out_rows = out.index_select(0, inverse)
+    lse_rows = lse.index_select(0, inverse)
+    weight = torch.sigmoid(lse_rows - acc_lse).unsqueeze(-1)
+    delta_lse = F.logsigmoid(acc_lse - lse_rows)
+    acc.sub_(weight * (acc - out_rows.float()))
+    acc_lse.sub_(delta_lse)
+
+
+def merge_into_result_gathered(
+    result: torch.Tensor,
+    acc: torch.Tensor,
+    acc_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    inverse: torch.Tensor,
+) -> None:
+    """``merge_into_result`` for a permuting final pass; see :func:`merge_into_gathered`."""
+    out_rows = out.index_select(0, inverse)
+    lse_rows = lse.index_select(0, inverse)
+    weight = torch.sigmoid(lse_rows - acc_lse).unsqueeze(-1)
+    result.copy_(acc - weight * (acc - out_rows.float()))
+
+
+#: In-place merge kernels, compiled once per device type on first use.
+_MERGE_KERNELS: tuple[Callable[..., None], ...] = (
+    merge_into,
+    merge_into_result,
+    merge_into_gathered,
+    merge_into_result_gathered,
+)
+_compiled_merge_kernels: tuple[Callable[..., None], ...] | None = None
+
+
+def _merge_kernels_for(device: torch.device) -> tuple[Callable[..., None], ...]:
+    # Elementwise over the accumulator rows: one dynamic-shape graph per kernel
+    # serves every geometry.  CPU (tests) runs eager.
     if device.type != "cuda":
-        return merge_step
-    global _compiled_merge_step
-    if _compiled_merge_step is None:
-        _compiled_merge_step = torch.compile(merge_step, fullgraph=True, dynamic=True)
-    return _compiled_merge_step
+        return _MERGE_KERNELS
+    global _compiled_merge_kernels
+    if _compiled_merge_kernels is None:
+        _compiled_merge_kernels = tuple(
+            torch.compile(kernel, fullgraph=True, dynamic=True) for kernel in _MERGE_KERNELS
+        )
+    return _compiled_merge_kernels
+
+
+def _inverse_permutation(index: torch.Tensor) -> torch.Tensor:
+    """Inverse of a full-coverage ``q_index``, cached on the plan tensor.
+
+    A pass whose row count equals the GEN length touches every row exactly
+    once -- the planner rejects repeats -- so ``q_index`` is a permutation and
+    has an inverse.  It is part of the request-local plan, so derive it once
+    and keep it alongside; the plan tensors outlive every denoise step.
+    """
+    inverse = getattr(index, "_cosmos3_inverse_permutation", None)
+    if inverse is None:
+        inverse = torch.empty_like(index)
+        inverse.scatter_(0, index, torch.arange(index.numel(), device=index.device, dtype=index.dtype))
+        try:
+            index._cosmos3_inverse_permutation = inverse
+        except (AttributeError, RuntimeError):
+            # Cannot cache on this tensor (e.g. a traced subclass); recompute.
+            pass
+    return inverse
 
 
 def _maskless_attention_impl(
@@ -227,7 +325,7 @@ def _maskless_attention_impl(
         raise ValueError("Maskless attention requires an integral GQA ratio.")
     heads, head_dim = q.shape[2], q.shape[3]
     kernel = get_pass_kernel(kernel_name)
-    merge = _merge_step_for(q.device)
+    merge_in, merge_final, merge_in_gathered, merge_final_gathered = _merge_kernels_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
     # inference-mode temporaries.
@@ -235,6 +333,7 @@ def _maskless_attention_impl(
     with torch.inference_mode():
         acc: torch.Tensor | None = None
         acc_lse: torch.Tensor | None = None
+        folded = False
         for index in range(num_passes):
             q_index, k_index, cu_seqlens_q, cu_seqlens_k, meta = plan[
                 index * TENSORS_PER_PASS : (index + 1) * TENSORS_PER_PASS
@@ -266,6 +365,11 @@ def _maskless_attention_impl(
                     f"Maskless pass kernel returned output {tuple(out.shape)} and LSE {tuple(lse.shape)} "
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
+            # The last pass can fold straight into the result: nothing reads the
+            # accumulators afterwards, so its stores and the output copy merge.
+            # Only a pass covering every row may do so -- a partial one would
+            # leave the rows it does not touch unwritten.
+            is_last_pass = index == num_passes - 1 and rows == planned_tokens
             if acc is None:
                 # The same-view pass covers every row and seeds the accumulators.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
@@ -278,25 +382,49 @@ def _maskless_attention_impl(
                     else:
                         acc.index_copy_(0, q_index[chunk], out[chunk].float())
                         acc_lse.index_copy_(0, q_index[chunk], lse[chunk].float())
-            else:
+            elif identity_q:
+                folded = is_last_pass
                 for start in range(0, rows, MERGE_CHUNK_SIZE):
                     chunk = slice(start, start + MERGE_CHUNK_SIZE)
-                    if identity_q:
-                        merged, merged_lse = merge(acc[chunk], acc_lse[chunk], out[chunk], lse[chunk])
-                        acc[chunk].copy_(merged)
-                        acc_lse[chunk].copy_(merged_lse)
+                    if folded:
+                        merge_final(result[0, chunk], acc[chunk], acc_lse[chunk], out[chunk], lse[chunk])
                     else:
+                        merge_in(acc[chunk], acc_lse[chunk], out[chunk], lse[chunk])
+            else:
+                # A pass covering every row permutes them, so walk the
+                # accumulator in order and gather the branch rows instead.
+                # CPU keeps the pass-order traversal: its vectorized sigmoid is
+                # not position-invariant, so reordering the rows would shift the
+                # last ULP away from the reference the tests compare against.
+                reorders = rows == planned_tokens and q.device.type == "cuda"
+                inverse = _inverse_permutation(q_index) if reorders else None
+                if inverse is None:
+                    for start in range(0, rows, MERGE_CHUNK_SIZE):
+                        chunk = slice(start, start + MERGE_CHUNK_SIZE)
                         gather = q_index[chunk]
-                        merged, merged_lse = merge(
-                            acc.index_select(0, gather), acc_lse.index_select(0, gather), out[chunk], lse[chunk]
-                        )
-                        acc.index_copy_(0, gather, merged)
-                        acc_lse.index_copy_(0, gather, merged_lse)
+                        rows_acc = acc.index_select(0, gather)
+                        rows_lse = acc_lse.index_select(0, gather)
+                        merge_in(rows_acc, rows_lse, out[chunk], lse[chunk])
+                        acc.index_copy_(0, gather, rows_acc)
+                        acc_lse.index_copy_(0, gather, rows_lse)
+                else:
+                    folded = is_last_pass
+                    for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
+                        chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                        if folded:
+                            merge_final_gathered(
+                                result[0, chunk], acc[chunk], acc_lse[chunk], out, lse, inverse[chunk]
+                            )
+                        else:
+                            merge_in_gathered(acc[chunk], acc_lse[chunk], out, lse, inverse[chunk])
             del out, lse
         assert acc is not None
-        for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
-            chunk = slice(start, start + MERGE_CHUNK_SIZE)
-            result[0, chunk].copy_(acc[chunk])
+        if not folded:
+            # No final fold happened (a single pass, a last pass covering only
+            # some rows, or the CPU scatter path), so cast the accumulator.
+            for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
+                chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                result[0, chunk].copy_(acc[chunk])
     return result
 
 
