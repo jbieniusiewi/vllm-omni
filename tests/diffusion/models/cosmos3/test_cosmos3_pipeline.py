@@ -3692,6 +3692,10 @@ def test_multiview_forward_per_view_negative_captions(
     pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
     pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
     pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 150, 1, 1)
+    # The WSM control path encodes one camera at a time, overlapping each
+    # camera's decode with the previous camera's encode, so it goes through the
+    # single-clip encode. Two cameras x 75 latent frames = the 150 above.
+    pipeline._encode_video_tensor = lambda *args, **kwargs: torch.zeros(1, 2, 75, 1, 1)
     pipeline._prepare_multiview_latents = lambda **kwargs: (
         torch.zeros(1, 2, 150, 1, 1),
         torch.ones(1, 1, 150, 1, 1),
