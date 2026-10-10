@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -126,6 +127,44 @@ def _normalize_local_condition_indexes(value: Any) -> list[int]:
     else:
         raise TypeError("Cosmos3 multiview condition_frame_indexes_vision must be an int, list, or CSV string.")
     return sorted({int(index) for index in values})
+
+
+#: Upper bound on concurrent per-view pixel decodes. Each in-flight view holds
+#: its full-resolution decoded clip (around a gigabyte for 1080p source media),
+#: so concurrency is capped here and further reduced by the CPU count and the
+#: host's free memory. Raising it trades resident memory for decode overlap.
+_PIXEL_PREPARE_MAX_WORKERS = 4
+#: Assumed resident footprint of one in-flight view, in bytes. Deliberately
+#: generous: the cost of over-estimating is less overlap, the cost of
+#: under-estimating is host memory pressure during preprocessing.
+_PIXEL_PREPARE_BYTES_PER_VIEW = 3 << 30
+
+
+def _pixel_prepare_workers(num_views: int) -> int:
+    """Concurrency for per-view pixel preparation, bounded by CPUs and free RAM.
+
+    Returns 1 whenever overlap cannot help or cannot be afforded, which keeps
+    the sequential path for single-camera requests and for hosts too small or
+    too busy to hold several decoded clips at once.
+    """
+    if num_views <= 1:
+        return 1
+    workers = min(num_views, _PIXEL_PREPARE_MAX_WORKERS)
+    # Prefer the CPUs this process may actually run on: a container pinned to
+    # a few cores of a large host must not size the pool from the host total.
+    try:
+        cpus: int | None = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpus = os.cpu_count()
+    if cpus:
+        workers = min(workers, max(1, cpus // 2))
+    try:  # Linux-only; absent elsewhere, in which case the CPU bound stands.
+        available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        available = None
+    if available is not None and available > 0:
+        workers = min(workers, max(1, int(available // _PIXEL_PREPARE_BYTES_PER_VIEW)))
+    return max(1, workers)
 
 
 def _pad_multiview_view_video(
@@ -544,13 +583,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        def prepare(view: Mapping[str, Any]) -> torch.Tensor:
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
-                    continue
+                    return torch.full((3, num_frames, height, width), 128, dtype=torch.uint8)
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(
                 value,
@@ -562,8 +599,20 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError(
                     f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
+            return _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+
+        # Per-view preparation is independent and dominated by the ffmpeg
+        # decode and the resize, both of which release the GIL, so a small
+        # thread pool overlaps them while the GPU is otherwise idle. Results
+        # are collected in view order, so the packed tensor is unchanged.
+        workers = _pixel_prepare_workers(len(views))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cosmos3-mv-pixels") as pool:
+                prepared = list(pool.map(prepare, views))
+        else:
+            prepared = [prepare(view) for view in views]
         camera_major = torch.cat(prepared, dim=1)
+        del prepared
         return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
 
     def _encode_multiview_video(
