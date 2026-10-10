@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -93,6 +94,18 @@ COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
 # two cannot drift and accidentally trigger shape-specific recompilation.
 COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS = 2
 COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS
+
+
+# Cameras prepared concurrently in ``_prepare_camera_major_pixels``. Each worker
+# holds one camera's full-resolution decode, so the cap bounds host memory as
+# well as thread oversubscription, and small hosts stay on the serial path.
+COSMOS3_MULTIVIEW_MAX_MEDIA_DECODE_WORKERS = 4
+
+
+def _media_decode_workers(num_jobs: int) -> int:
+    """Concurrent host-side camera decodes, from the machine's own core count."""
+    cores = os.cpu_count() or 1
+    return max(1, min(num_jobs, cores // 4, COSMOS3_MULTIVIEW_MAX_MEDIA_DECODE_WORKERS))
 
 
 def _media_kind(value: Any) -> str:
@@ -544,26 +557,49 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        # Decoding one camera is a container read plus an antialiased resize, so
+        # it alternates between a single-threaded ffmpeg pipe and multi-threaded
+        # torch kernels. Done camera by camera, each phase idles the resource the
+        # other needs; a rig of eleven 1080p clips spends tens of seconds here
+        # before the first VAE encode. Preparing a few cameras concurrently
+        # overlaps the two. Every camera is independent and resizing is
+        # bit-identical for any thread count, so the pixels are unchanged.
+        prepared: list[torch.Tensor | None] = [None] * len(views)
+        pending: list[tuple[int, Any]] = []
+        for index, view in enumerate(views):
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
+                    prepared[index] = torch.full((3, num_frames, height, width), 128, dtype=torch.uint8)
                     continue
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
-            frames = media_to_uint8_cthw(
+            pending.append((index, value))
+
+        def decode(value: Any) -> torch.Tensor:
+            return media_to_uint8_cthw(
                 value,
                 height=height,
                 width=width,
                 max_frames=1 if keep_first else num_frames,
             )
+
+        if len(pending) > 1 and (workers := _media_decode_workers(len(pending))) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                # Keep the submission order so a failing camera reports the same
+                # error the serial path would have raised first.
+                decoded = list(pool.map(decode, [value for _, value in pending]))
+        else:
+            decoded = [decode(value) for _, value in pending]
+
+        for (index, _), frames in zip(pending, decoded, strict=True):
             if require_complete and frames.shape[1] < num_frames:
                 raise ValueError(
-                    f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
+                    f"Known camera {views[index]['camera_key']!r} requires a complete RGB video "
+                    f"of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
-        camera_major = torch.cat(prepared, dim=1)
+            prepared[index] = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+
+        camera_major = torch.cat([tensor for tensor in prepared if tensor is not None], dim=1)
         return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
 
     def _encode_multiview_video(
