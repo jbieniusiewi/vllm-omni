@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from .multiview_flex_attention import MultiviewAttentionContext
+from .multiview_maskless_merge import fused_merge, fused_merge_available
 from .multiview_maskless_plan import (
     META_GEN_TOKENS,
     META_IDENTITY_K,
@@ -228,6 +229,10 @@ def _maskless_attention_impl(
     heads, head_dim = q.shape[2], q.shape[3]
     kernel = get_pass_kernel(kernel_name)
     merge = _merge_step_for(q.device)
+    # The fused merge addresses the accumulator in place, so it needs neither
+    # the gather/scatter round trips nor the chunking that bounds their FP32
+    # temporaries. Same arithmetic, so the accumulator is bit-identical.
+    fused = fused_merge_available(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
     # inference-mode temporaries.
@@ -270,6 +275,11 @@ def _maskless_attention_impl(
                 # The same-view pass covers every row and seeds the accumulators.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
                 acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
+            if fused and out.is_contiguous() and lse.is_contiguous() and q_index.is_contiguous():
+                fused_merge(
+                    acc, acc_lse, out, lse, None if identity_q else q_index, seed=index == 0
+                )
+            elif index == 0:
                 for start in range(0, rows, MERGE_CHUNK_SIZE):
                     chunk = slice(start, start + MERGE_CHUNK_SIZE)
                     if identity_q:
