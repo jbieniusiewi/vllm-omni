@@ -198,6 +198,128 @@ def _merge_step_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, t
     return _compiled_merge_step
 
 
+# ---------------------------------------------------------------------------
+# Fused in-place merge
+# ---------------------------------------------------------------------------
+# The chunked ``index_select`` -> ``merge_step`` -> ``index_copy_`` recurrence
+# below reads and writes the FP32 accumulator three times per pass (gather,
+# elementwise merge, scatter), each through a separate kernel and a full-size
+# temporary.  The recurrence is pointwise in ``(row, head, dim)``, so one
+# kernel can gather, merge and scatter in registers: the accumulator is read
+# once and written once, and no temporary is materialized.
+#
+# The arithmetic is kept in the same order and the same FP32 precision as
+# ``merge_step``'s Inductor lowering -- ``sigmoid(lse - acc_lse)``,
+# ``acc - w * (acc - out)`` and ``acc_lse - logsigmoid(acc_lse - lse)`` with
+# ``logsigmoid`` expanded as ``min(0, s) - log1p(exp(-|s|))`` -- so the merged
+# result is bit-identical to the chunked path it replaces.
+
+_HAS_TRITON = False
+try:  # Triton ships with CUDA/ROCm PyTorch; CPU-only builds fall back below.
+    import triton
+    import triton.language as tl
+    from triton.language.extra import libdevice
+
+    _HAS_TRITON = True
+except ImportError:  # pragma: no cover - exercised on CPU-only installs
+    pass
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _fused_merge_kernel(
+        acc_ptr,
+        acc_lse_ptr,
+        out_ptr,
+        lse_ptr,
+        index_ptr,
+        numel,
+        HEAD_DIM: tl.constexpr,
+        DIM: tl.constexpr,
+        IDENTITY: tl.constexpr,
+        SEED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """One accumulator read/write per element of one pass output.
+
+        ``offset`` enumerates the pass output's ``[rows, heads, dim]`` elements.
+        ``IDENTITY`` passes cover every accumulator row in order, so the
+        destination is the offset itself; otherwise ``index_ptr`` maps the pass
+        row to its accumulator row.  ``SEED`` writes the first pass instead of
+        merging into it.
+        """
+        offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offset < numel
+        head_row = offset // DIM  # row * heads + head
+        if IDENTITY:
+            acc_offset = offset
+            lse_offset = head_row
+        else:
+            row = tl.load(index_ptr + offset // HEAD_DIM, mask, other=0).to(tl.int64)
+            acc_offset = row * HEAD_DIM + (offset % HEAD_DIM)
+            lse_offset = row * (HEAD_DIM // DIM) + (head_row % (HEAD_DIM // DIM))
+        out = tl.load(out_ptr + offset, mask, other=0.0).to(tl.float32)
+        lse = tl.load(lse_ptr + head_row, mask, other=0.0).to(tl.float32)
+        if SEED:
+            tl.store(acc_ptr + acc_offset, out, mask)
+            tl.store(acc_lse_ptr + lse_offset, lse, mask)
+        else:
+            acc = tl.load(acc_ptr + acc_offset, mask, other=0.0)
+            acc_lse = tl.load(acc_lse_ptr + lse_offset, mask, other=0.0)
+            weight = tl.sigmoid(lse - acc_lse)
+            tl.store(acc_ptr + acc_offset, acc - weight * (acc - out), mask)
+            shift = acc_lse - lse
+            log_sigmoid = tl.minimum(0.0, shift) - libdevice.log1p(libdevice.exp(-tl.abs(shift)))
+            tl.store(acc_lse_ptr + lse_offset, acc_lse - log_sigmoid, mask)
+
+
+#: Elements per program in the fused merge. 2048 keeps the indirect-index
+#: divisions cheap while giving the memory system enough work in flight.
+_FUSED_MERGE_BLOCK = 2048
+
+
+def fused_merge_pass(
+    acc: torch.Tensor,
+    acc_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q_index: torch.Tensor,
+    *,
+    identity_q: bool,
+    seed: bool,
+) -> None:
+    """Merge one pass output into the accumulators in place."""
+    rows, heads, head_dim = out.shape
+    numel = rows * heads * head_dim
+    if numel == 0:
+        return
+    grid = (triton.cdiv(numel, _FUSED_MERGE_BLOCK),)
+    _fused_merge_kernel[grid](
+        acc,
+        acc_lse,
+        out,
+        lse,
+        q_index,
+        numel,
+        heads * head_dim,
+        head_dim,
+        identity_q,
+        seed,
+        _FUSED_MERGE_BLOCK,
+        num_warps=4,
+    )
+
+
+def _can_fuse_merge(acc: torch.Tensor, out: torch.Tensor, lse: torch.Tensor, q_index: torch.Tensor) -> bool:
+    """Flat indexing in the fused kernel requires contiguous CUDA tensors."""
+    return (
+        _HAS_TRITON
+        and acc.is_cuda
+        and all(tensor.is_contiguous() for tensor in (acc, out, lse, q_index))
+        and out.shape[1:] == acc.shape[1:]
+    )
+
+
 def _maskless_attention_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -266,10 +388,16 @@ def _maskless_attention_impl(
                     f"Maskless pass kernel returned output {tuple(out.shape)} and LSE {tuple(lse.shape)} "
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
-            if acc is None:
+            seed = acc is None
+            if seed:
                 # The same-view pass covers every row and seeds the accumulators.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
                 acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
+            if _can_fuse_merge(acc, out, lse, q_index):
+                # One pass over the accumulator: gather, merge and scatter all
+                # happen in registers, so no chunking or temporary is needed.
+                fused_merge_pass(acc, acc_lse, out, lse, q_index, identity_q=identity_q, seed=seed)
+            elif seed:
                 for start in range(0, rows, MERGE_CHUNK_SIZE):
                     chunk = slice(start, start + MERGE_CHUNK_SIZE)
                     if identity_q:
