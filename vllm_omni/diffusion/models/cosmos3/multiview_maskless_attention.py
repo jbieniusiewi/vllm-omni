@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from .multiview_flex_attention import MultiviewAttentionContext
+from .multiview_maskless_merge import can_fuse, merge_scatter, seed_scatter
 from .multiview_maskless_plan import (
     META_GEN_TOKENS,
     META_IDENTITY_K,
@@ -270,14 +271,22 @@ def _maskless_attention_impl(
                 # The same-view pass covers every row and seeds the accumulators.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
                 acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
-                for start in range(0, rows, MERGE_CHUNK_SIZE):
-                    chunk = slice(start, start + MERGE_CHUNK_SIZE)
-                    if identity_q:
+                if identity_q:
+                    for start in range(0, rows, MERGE_CHUNK_SIZE):
+                        chunk = slice(start, start + MERGE_CHUNK_SIZE)
                         acc[chunk].copy_(out[chunk])
                         acc_lse[chunk].copy_(lse[chunk])
-                    else:
+                elif can_fuse(acc, out, q_index):
+                    seed_scatter(acc, acc_lse, out, lse, q_index)
+                else:
+                    for start in range(0, rows, MERGE_CHUNK_SIZE):
+                        chunk = slice(start, start + MERGE_CHUNK_SIZE)
                         acc.index_copy_(0, q_index[chunk], out[chunk].float())
                         acc_lse.index_copy_(0, q_index[chunk], lse[chunk].float())
+            elif not identity_q and can_fuse(acc, out, q_index):
+                # Fused gather/merge/scatter: one pass over the accumulator per
+                # branch instead of three, same arithmetic (see the merge module).
+                merge_scatter(acc, acc_lse, out, lse, q_index)
             else:
                 for start in range(0, rows, MERGE_CHUNK_SIZE):
                     chunk = slice(start, start + MERGE_CHUNK_SIZE)
