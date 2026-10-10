@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar
 
 import numpy as np
 import PIL.Image
@@ -93,6 +94,72 @@ COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
 # two cannot drift and accidentally trigger shape-specific recompilation.
 COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS = 2
 COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS
+
+
+#: Upper bound on cameras prepared concurrently by
+#: :func:`_map_views_concurrently`. Decoding a view holds its full-resolution
+#: frames (a 201-frame 1080p clip is ~1.2 GiB), so the pool is additionally
+#: sized against free host memory at call time; this caps the pool on hosts
+#: with lots of free RAM but few cores.
+COSMOS3_MULTIVIEW_MAX_PREPARE_WORKERS = 4
+#: Host memory a single in-flight camera may need, as a multiple of the
+#: estimated size of its decoded full-resolution frames.
+_PREPARE_MEMORY_SAFETY_FACTOR = 3.0
+#: Fraction of currently available host memory the prepare pool may plan to use.
+_PREPARE_MEMORY_BUDGET_FRACTION = 0.25
+
+_ViewResult = TypeVar("_ViewResult")
+
+
+def _available_memory_bytes() -> int | None:
+    """Host memory available right now, or ``None`` when it cannot be read."""
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _prepare_worker_count(num_views: int, bytes_per_view: int | None) -> int:
+    """Cameras to prepare concurrently, bounded by cores and free host memory.
+
+    Per-view preparation is independent and dominated by video decoding and the
+    antialiased resize, both of which release the GIL, so threads overlap while
+    keeping the work in this process (no tensor pickling, no fork). The result
+    is bit-identical to sequential preparation: each view is a separate call and
+    the views are reassembled in request order.
+    """
+    workers = min(num_views, COSMOS3_MULTIVIEW_MAX_PREPARE_WORKERS, os.cpu_count() or 1)
+    if workers <= 1:
+        return 1
+    if bytes_per_view and bytes_per_view > 0:
+        available = _available_memory_bytes()
+        if available is not None:
+            budget = int(available * _PREPARE_MEMORY_BUDGET_FRACTION)
+            affordable = budget // max(1, int(bytes_per_view * _PREPARE_MEMORY_SAFETY_FACTOR))
+            workers = max(1, min(workers, affordable))
+    return workers
+
+
+def _map_views_concurrently(
+    prepare: Callable[[int], _ViewResult],
+    num_views: int,
+    *,
+    bytes_per_view: int | None = None,
+) -> list[_ViewResult]:
+    """Apply ``prepare`` to every view index, in order, overlapping the work.
+
+    Falls back to a plain sequential loop for a single view or a single worker,
+    so hosts that cannot afford concurrency keep the previous behaviour.
+    """
+    workers = _prepare_worker_count(num_views, bytes_per_view)
+    if workers <= 1:
+        return [prepare(view) for view in range(num_views)]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cosmos3-mv-prep") as pool:
+        return list(pool.map(prepare, range(num_views)))
 
 
 def _media_kind(value: Any) -> str:
@@ -544,13 +611,12 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        def prepare_view(index: int) -> torch.Tensor:
+            view = views[index]
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
-                    continue
+                    return torch.full((3, num_frames, height, width), 128, dtype=torch.uint8)
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(
                 value,
@@ -562,9 +628,48 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError(
                     f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
+            return _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+
+        # Decoding and resizing a camera is independent per view and runs with
+        # the GPU idle, so overlap the views. Each call is unchanged and the
+        # results are concatenated in request order, so the packed pixels are
+        # bit-identical to preparing the views one at a time.
+        prepared = _map_views_concurrently(
+            prepare_view,
+            len(views),
+            bytes_per_view=self._prepare_view_source_bytes(
+                views, field=field, num_frames=1 if keep_first else num_frames
+            ),
+        )
         camera_major = torch.cat(prepared, dim=1)
+        del prepared
         return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
+
+    def _prepare_view_source_bytes(
+        self,
+        views: Sequence[Mapping[str, Any]],
+        *,
+        field: str,
+        num_frames: int,
+    ) -> int | None:
+        """Estimate one view's decoded full-resolution frame bytes, for pool sizing.
+
+        Reads the first camera's source geometry only; a wrong or missing
+        estimate affects only how many views are prepared at once, never the
+        pixels produced. Any probe failure returns ``None`` (size by cores).
+        """
+        for view in views:
+            value = self._view_value(view, field)
+            if value is None:
+                continue
+            try:
+                source_hw = media_hw(value)
+            except Exception:  # noqa: BLE001 - sizing hint only
+                return None
+            if source_hw is None or min(source_hw) <= 0:
+                return None
+            return 3 * int(num_frames) * int(source_hw[0]) * int(source_hw[1])
+        return None
 
     def _encode_multiview_video(
         self,
