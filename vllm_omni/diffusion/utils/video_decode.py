@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from collections import deque
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any, Literal
 
 import numpy as np
@@ -47,6 +48,18 @@ def _frame_to_uint8_rgb(value: Any) -> np.ndarray:
             array = (np.clip(array, 0.0, 1.0) * 255.0).round().astype(np.uint8)
         return array[..., :3].astype(np.uint8)
     raise TypeError(f"Video decode expected an RGB frame, got {type(value)!r}.")
+
+
+def _frame_to_uint8_rgb_view(value: Any) -> np.ndarray:
+    """``_frame_to_uint8_rgb`` without the defensive copy of an already-RGB frame.
+
+    The decoder may hand back a buffer it reuses for the next frame, so the
+    result is only valid until the iterator advances. Only the streaming
+    iterator uses this; list-returning callers keep the copying variant.
+    """
+    if isinstance(value, np.ndarray) and value.ndim == 3 and value.dtype == np.uint8 and value.shape[-1] in (3, 4):
+        return value[..., :3]
+    return _frame_to_uint8_rgb(value)
 
 
 def decode_path_video_frames(
@@ -89,3 +102,35 @@ def decode_path_video_frames(
     if not frames:
         raise ValueError(f"Video path produced no frames: {media_path}")
     return frames
+
+
+def iter_path_video_frames(path: str | Path, *, max_frames: int | None = None) -> Iterator[np.ndarray]:
+    """Yield the leading RGB uint8 frames of a video file one at a time.
+
+    The same frames ``decode_path_video_frames(..., keep="first")`` returns,
+    without holding the whole decoded clip: a consumer that copies each frame
+    into its own destination pays one copy instead of accumulating a list and
+    copying again. Each yielded array is only valid until the next frame is
+    requested, so copy what you keep.
+    """
+    media_path = Path(path)
+    if not media_path.exists():
+        raise FileNotFoundError(f"Video path does not exist: {media_path}")
+    if max_frames is not None and int(max_frames) <= 0:
+        raise ValueError("Video max_frames must be positive.")
+    try:
+        import imageio.v3 as iio
+    except ImportError as exc:
+        raise ImportError(
+            "Video path decoding requires imageio. Install imageio[ffmpeg] or provide decoded frames."
+        ) from exc
+
+    limit = None if max_frames is None else int(max_frames)
+    count = 0
+    for frame in iio.imiter(media_path):
+        yield _frame_to_uint8_rgb_view(frame)
+        count += 1
+        if limit is not None and count >= limit:
+            break
+    if not count:
+        raise ValueError(f"Video path produced no frames: {media_path}")
