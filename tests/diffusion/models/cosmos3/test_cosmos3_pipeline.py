@@ -16,6 +16,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from diffusers.video_processor import VideoProcessor
 from PIL import Image
 from torch import nn
 
@@ -854,8 +855,7 @@ def test_multiview_postprocess_preserves_camera_order_lidar_and_metadata(output_
     assert "internal" in output["metadata"]
 
 
-@pytest.mark.parametrize("output_type", ["np", "pt"])
-def test_multiview_postprocess_releases_converted_view_before_next_camera(monkeypatch, output_type: str) -> None:
+def test_multiview_postprocess_releases_converted_view_before_next_camera(monkeypatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as pipeline_module
 
     converted_views = []
@@ -875,10 +875,51 @@ def test_multiview_postprocess_releases_converted_view_before_next_camera(monkey
             "payload": {"video": torch.zeros(1, 3, 9, 4, 4)},
             "metadata": {"multiview": {"cameras": ["front", "rear", "left"], "frames_per_view": 3}},
         },
-        output_type=output_type,
+        output_type="pt",
     )
     assert len(converted_views) == 3
     assert all(reference() is None for reference in converted_views)
+
+
+def test_multiview_postprocess_numpy_matches_the_shared_video_processor() -> None:
+    """The direct NumPy path must produce exactly what ``VideoProcessor`` does.
+
+    ``output_type="np"`` writes each camera's denormalized values straight into
+    the output array instead of routing them through the shared processor's
+    whole-clip temporaries, so pin the equivalence rather than the call
+    pattern: same values, same dtype, for in-range, out-of-range and
+    clamp-boundary inputs across the dtypes a VAE decode can return.
+    """
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    cameras = ["front", "rear", "left"]
+    frames_per_view = 3
+    processor = VideoProcessor(vae_scale_factor=16)
+    torch.manual_seed(0)
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        for scale, offset in ((2.0, -1.0), (6.0, -3.0)):
+            video = (torch.rand(1, 3, len(cameras) * frames_per_view, 4, 5) * scale + offset).to(dtype)
+            expected = np.concatenate(
+                [
+                    processor.postprocess_video(
+                        video.narrow(2, index * frames_per_view, frames_per_view), output_type="np"
+                    )
+                    for index in range(len(cameras))
+                ],
+                axis=1,
+            )
+            result = postprocess(
+                {
+                    "payload": {"video": video},
+                    "metadata": {"multiview": {"cameras": cameras, "frames_per_view": frames_per_view}},
+                },
+                output_type="np",
+            )["payload"]["video"]
+            assert result.dtype == expected.dtype
+            assert np.array_equal(result, expected), f"{dtype} scale={scale} offset={offset}"
 
 
 @pytest.mark.parametrize(
@@ -3692,6 +3733,10 @@ def test_multiview_forward_per_view_negative_captions(
     pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
     pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
     pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 150, 1, 1)
+    # The WSM control path encodes one camera at a time, overlapping each
+    # camera's decode with the previous camera's encode, so it goes through the
+    # single-clip encode. Two cameras x 75 latent frames = the 150 above.
+    pipeline._encode_video_tensor = lambda *args, **kwargs: torch.zeros(1, 2, 75, 1, 1)
     pipeline._prepare_multiview_latents = lambda **kwargs: (
         torch.zeros(1, 2, 150, 1, 1),
         torch.ones(1, 1, 150, 1, 1),
