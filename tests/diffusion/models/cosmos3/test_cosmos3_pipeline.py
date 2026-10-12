@@ -1649,6 +1649,60 @@ def test_transfer_center_crop_rounds_offsets_like_torchvision() -> None:
     assert cropped[0, 0, :, 0].tolist() == [20, 30, 40, 50]
 
 
+def _stub_encode(pixels: torch.Tensor) -> torch.Tensor:
+    """Stands in for the VAE: deterministic, per camera, and shape-reducing."""
+    return pixels[:, :, :, :4, :4].mul(1.5).add(0.25)
+
+
+def _control_latents(count: int, *, overlapped: bool, missing: tuple[int, ...] = ()) -> torch.Tensor:
+    """Encode ``count`` cameras either interleaved with, or after, preparation."""
+    from functools import partial
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    generator = torch.Generator().manual_seed(5)
+    views = []
+    for index in range(count):
+        view = {"camera_key": f"cam{index}"}
+        if index not in missing:
+            view["control"] = torch.rand(3, 5, 40, 60, generator=generator).mul(2).sub(1)
+        views.append(view)
+    stub = SimpleNamespace(
+        dtype=torch.float32, _view_value=Cosmos3MultiviewPipeline._view_value, _encode_video_tensor=_stub_encode
+    )
+    stub._encode_multiview_video = partial(Cosmos3MultiviewPipeline._encode_multiview_video, stub)
+    stub._prepare_camera_major_pixels = partial(Cosmos3MultiviewPipeline._prepare_camera_major_pixels, stub)
+    if overlapped:
+        return Cosmos3MultiviewPipeline._prepare_and_encode_camera_major_pixels(
+            stub, views, field="control", height=16, width=24, num_frames=5
+        )
+    pixels = stub._prepare_camera_major_pixels(
+        views, field="control", height=16, width=24, num_frames=5, keep_first=False
+    )
+    return Cosmos3MultiviewPipeline._encode_multiview_video(stub, pixels, num_views=count, frames_per_view=5)
+
+
+def test_multiview_overlapped_encode_matches_prepare_then_encode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Interleaving the decodes with the encode must not move a single bit."""
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as mv
+
+    monkeypatch.setattr(mv, "_CAMERA_PREPARE_MAX_WORKERS", 1)
+    reference = _control_latents(6, overlapped=False)
+    assert tuple(reference.shape) == (1, 3, 6 * 5, 4, 4)
+    for workers in (1, 4, 16):  # pool off, the default, and more threads than cameras
+        monkeypatch.setattr(mv, "_CAMERA_PREPARE_MAX_WORKERS", workers)
+        assert torch.equal(_control_latents(6, overlapped=True), reference)
+
+
+def test_multiview_overlapped_encode_reports_the_first_failing_camera(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cameras decode concurrently; the error is still the first in camera order."""
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as mv
+
+    monkeypatch.setattr(mv, "_CAMERA_PREPARE_MAX_WORKERS", 4)
+    with pytest.raises(ValueError, match="'cam2' is missing control input"):
+        _control_latents(6, overlapped=True, missing=(2, 4))
+
+
 def test_transfer_control_weight_validation_and_normalization() -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
 
@@ -3691,7 +3745,9 @@ def test_multiview_forward_per_view_negative_captions(
     pipeline.multiview_backend = "triton"
     pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
     pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
-    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 150, 1, 1)
+    # 75 latent frames per camera, sized from num_views, so the stub serves both
+    # the all-cameras call and the per-camera calls the overlap makes.
+    pipeline._encode_multiview_video = lambda *a, num_views=2, **k: torch.zeros(1, 2, 75 * num_views, 1, 1)
     pipeline._prepare_multiview_latents = lambda **kwargs: (
         torch.zeros(1, 2, 150, 1, 1),
         torch.ones(1, 1, 150, 1, 1),

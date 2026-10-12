@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -137,6 +138,10 @@ def _normalize_local_condition_indexes(value: Any) -> list[int]:
 _CAMERA_PREPARE_MAX_WORKERS = 4
 
 
+def _camera_prepare_workers(count: int) -> int:
+    return min(count, _CAMERA_PREPARE_MAX_WORKERS, os.cpu_count() or 1)
+
+
 def _run_camera_prepare_jobs(prepare: Callable[[int], None], count: int) -> None:
     """Run ``prepare(index)`` for every camera, overlapping independent views.
 
@@ -146,7 +151,7 @@ def _run_camera_prepare_jobs(prepare: Callable[[int], None], count: int) -> None
     propagates the first failure after cancelling the rest so a bad clip is
     still reported rather than leaving threads running.
     """
-    workers = min(count, _CAMERA_PREPARE_MAX_WORKERS, os.cpu_count() or 1)
+    workers = _camera_prepare_workers(count)
     if workers <= 1:
         for index in range(count):
             prepare(index)
@@ -634,6 +639,55 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             raise ValueError(f"Cosmos3 multiview per-camera VAE encodes have unequal lengths: {latent_frames}.")
         return torch.cat(per_view, dim=2)
 
+    def _prepare_and_encode_camera_major_pixels(
+        self,
+        views: Sequence[Mapping[str, Any]],
+        *,
+        field: str,
+        height: int,
+        width: int,
+        num_frames: int,
+    ) -> torch.Tensor:
+        """VAE-encode each camera as soon as its pixels are ready.
+
+        Preparing every camera first leaves the GPU idle for the whole decode
+        and then the host idle for the whole encode. The latents are unchanged:
+        normalization is elementwise and :meth:`_encode_multiview_video`
+        already encodes camera by camera, so this only reorders the work.
+        """
+
+        def encode(pixels: torch.Tensor) -> torch.Tensor:
+            # The same seam _encode_multiview_video uses, for one camera.
+            return self._encode_multiview_video(pixels, num_views=1, frames_per_view=num_frames)
+
+        def prepare(view: Mapping[str, Any]) -> torch.Tensor:
+            # One camera through the shared path; its own pool sizes to 1, so
+            # this stays inline and never nests a pool.
+            return self._prepare_camera_major_pixels(
+                [view], field=field, height=height, width=width, num_frames=num_frames, keep_first=False
+            )
+
+        workers = _camera_prepare_workers(len(views))
+        if workers > 1:
+            per_view = []
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="multiview-prepare") as pool:
+                # At most ``workers`` decodes in flight: enough to hide the
+                # encode without holding more prepared cameras than the
+                # prepare-then-encode path did. Consuming in camera order keeps
+                # the first failing camera the one that raises.
+                pending = deque(pool.submit(prepare, view) for view in views[:workers])
+                for view in views[workers:]:
+                    per_view.append(encode(pending.popleft().result()))
+                    pending.append(pool.submit(prepare, view))
+                while pending:
+                    per_view.append(encode(pending.popleft().result()))
+        else:
+            per_view = [encode(prepare(view)) for view in views]
+        latent_frames = {int(latent.shape[2]) for latent in per_view}
+        if len(latent_frames) != 1:
+            raise ValueError(f"Cosmos3 multiview per-camera VAE encodes have unequal lengths: {latent_frames}.")
+        return torch.cat(per_view, dim=2)
+
     def _decode_multiview_latents(
         self,
         camera_major_latents: torch.Tensor,
@@ -831,18 +885,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 keep_first=condition_video_as_image,
                 require_complete=completion,
             )
-        control_pixels = (
-            self._prepare_camera_major_pixels(
-                views,
-                field="control",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=False,
-            )
-            if selected_hints
-            else None
-        )
+        # Control pixels are prepared below, interleaved with their encode:
+        # preparing them here would hold the GPU idle for the whole decode. A
+        # control video that fails to decode therefore raises after the vision
+        # encode rather than before it.
 
         latent_frames_per_view = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_t = num_views * latent_frames_per_view
@@ -883,15 +929,17 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             injected_latents=injected_latents,
         )
         control_latents = (
-            self._encode_multiview_video(
-                control_pixels,
-                num_views=num_views,
-                frames_per_view=num_frames,
+            self._prepare_and_encode_camera_major_pixels(
+                views,
+                field="control",
+                height=height,
+                width=width,
+                num_frames=num_frames,
             )
-            if control_pixels is not None
+            if selected_hints
             else None
         )
-        del target_pixels, control_pixels
+        del target_pixels
         if control_latents is not None and control_latents.shape != latents.shape:
             raise ValueError(
                 "Cosmos3 multiview WSM and target latent shapes must match: "
