@@ -270,13 +270,35 @@ def _get_block_mask(
     )
 
 
-def _run_attention(query, key, value, block_mask, scale):
+def _kernel_options(head_dim: int, device: torch.device) -> dict:
+    """Launch options for one head size on one device; every choice keeps the reference numerics.
+
+    On NVIDIA GPUs, doubling the warps for heads of 64+ channels (the FP32
+    tiles otherwise spill registers) and pipelining the key/value loads where
+    shared memory holds the double-buffered FP32 tiles change neither the
+    block sizes nor any row's reduction order, so outputs stay bitwise
+    identical to the 4-warp single-stage kernel. Other devices keep it.
+    """
+    options = dict(_KERNEL_OPTIONS)
+    if device.type != "cuda" or torch.version.hip is not None:
+        return options
+    if head_dim >= 64:
+        options["num_warps"] = 8
+    stages = 2
+    padded_dim = 1 << max(head_dim - 1, 15).bit_length()
+    tile_bytes = 4 * padded_dim * (options["BLOCK_M"] + 2 * stages * options["BLOCK_N"])
+    if tile_bytes <= torch.cuda.get_device_properties(device).shared_memory_per_block_optin:
+        options["num_stages"] = stages
+    return options
+
+
+def _run_attention(query, key, value, block_mask, scale, kernel_options=_KERNEL_OPTIONS):
     head_dim = query.shape[-1]
     # Pad small head dimensions to 16 for CUDA FlexAttention. Zero padding
     # preserves Q @ K and P @ V with an explicit scale.
     if head_dim < 16:
         query, key, value = (F.pad(t, (0, 16 - head_dim)) for t in (query, key, value))
-    output = flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=_KERNEL_OPTIONS)
+    output = flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=kernel_options)
     return output[..., :head_dim] if head_dim < 16 else output
 
 
@@ -286,7 +308,8 @@ def _get_compiled_runner(device, shape, kernel, dilation, scale):
     # still hit its recompile limit across decoder levels and partial chunks.
     # Give each static specialization its own code object, without capturing
     # tensors or a mask (which would keep evicted device allocations alive).
-    runner = FunctionType(_run_attention.__code__.replace(), globals(), _run_attention.__name__)
+    options = _kernel_options(shape[-1], device)
+    runner = FunctionType(_run_attention.__code__.replace(), globals(), _run_attention.__name__, (options,))
     return torch.compile(runner, fullgraph=True, dynamic=False)
 
 
