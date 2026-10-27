@@ -56,6 +56,7 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
 )
 from vllm_omni.diffusion.models.cosmos3.transfer import as_bool, media_to_uint8_cthw, uint8_cthw_to_normalized_5d
 from vllm_omni.diffusion.models.cosmos3.utils import VIDEO_RES_SIZE_INFO
+from vllm_omni.diffusion.utils.host_copy import PinnedHostCopier
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
@@ -1173,18 +1174,20 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         num_views = state.num_views
         frames_per_view = state.rgb_target_latents.shape[2] // num_views
         decoded = None
-        for view in range(num_views):
-            clip = self._decode_latents(
-                state.rgb_target_latents.narrow(2, view * frames_per_view, frames_per_view)
-            ).clamp_(-1, 1)
-            if decoded is None:
-                decoded = torch.empty(
-                    (clip.shape[0], clip.shape[1], num_views * clip.shape[2], *clip.shape[3:]),
-                    dtype=clip.dtype,
-                    device="cpu",
-                )
-            decoded.narrow(2, view * clip.shape[2], clip.shape[2]).copy_(clip)
-            del clip
+        # Each view's device-to-host copy overlaps the next view's decode.
+        with PinnedHostCopier(thread_name_prefix="cosmos3-sim-auto-d2h") as copier:
+            for view in range(num_views):
+                clip = self._decode_latents(
+                    state.rgb_target_latents.narrow(2, view * frames_per_view, frames_per_view)
+                ).clamp_(-1, 1)
+                if decoded is None:
+                    decoded = torch.empty(
+                        (clip.shape[0], clip.shape[1], num_views * clip.shape[2], *clip.shape[3:]),
+                        dtype=clip.dtype,
+                        device="cpu",
+                    )
+                copier.copy(decoded.narrow(2, view * clip.shape[2], clip.shape[2]), clip)
+                del clip
         assert decoded is not None
         payload: dict[str, Any] = {"video": decoded}
         if return_latents:
