@@ -73,6 +73,19 @@ def _new_shm_array(shape: tuple[int, ...], dtype: np.dtype) -> tuple[Any, np.nda
     return shm, array, handle
 
 
+def _copy_array(destination: np.ndarray, source: np.ndarray) -> None:
+    """``np.copyto`` for same-shape arrays, through torch's threaded copy when torch accepts the arrays."""
+    if source.flags.writeable:
+        try:
+            destination_tensor, source_tensor = torch.from_numpy(destination), torch.from_numpy(source)
+        except (TypeError, ValueError):
+            pass
+        else:
+            destination_tensor.copy_(source_tensor)
+            return
+    np.copyto(destination, source)
+
+
 def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
     """Copy a contiguous NumPy-compatible array into shared memory."""
     if array.dtype.hasobject:
@@ -80,7 +93,7 @@ def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
 
     array = np.ascontiguousarray(array)
     shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
-    np.copyto(shm_array, array)
+    _copy_array(shm_array, array)
     del shm_array
     shm.close()
     return handle
@@ -103,7 +116,9 @@ def _array_from_shm(handle: dict[str, Any]) -> np.ndarray:
         shm.unlink()
         return borrowed
     try:
-        return array.copy()
+        owned = np.empty_like(array)
+        _copy_array(owned, array)
+        return owned
     finally:
         del array
         shm.close()
@@ -245,20 +260,18 @@ def _tensor_to_shm(
             torch.accelerator.set_stream(old_stream)
         d2h_stream.synchronize()
         tensor = cpu
-        # numpy has no bfloat16, so widen on the host after D2H. Never widen on
-        # the accelerator before the copy: a payload that already fell back after
-        # an fp32 OOM would OOM again on a second device-side fp32 allocation.
-        if original_dtype == torch.bfloat16:
-            tensor = tensor.to(torch.float32)
     else:
-        tensor = tensor.detach().cpu().contiguous()
-        if original_dtype == torch.bfloat16:
-            tensor = tensor.to(torch.float32)
-    handle = _array_to_shm(tensor.numpy())
+        tensor = tensor.detach().cpu()
+    # NumPy has no BF16 dtype: transfer the original bits as uint16 rather than
+    # widening to FP32.
+    if original_dtype == torch.bfloat16:
+        tensor = tensor.view(torch.uint16)
+    handle = _array_to_shm(tensor.contiguous().numpy())
     handle.update(
         {
             "__tensor_shm__": True,
             "torch_dtype": str(original_dtype),
+            "torch_dtype_view": original_dtype == torch.bfloat16,
         }
     )
     if created is not None:

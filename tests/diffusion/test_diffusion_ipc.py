@@ -430,12 +430,13 @@ def test_pack_value_preserves_dtype_shape_and_values_for_bfloat16() -> None:
         assert packed["__tensor_shm__"] is True
         assert packed["shape"] == list(tensor.shape)
         assert packed["torch_dtype"] == "torch.bfloat16"
-        assert packed["numpy_dtype"] == "float32"
+        assert packed["numpy_dtype"] == "uint16"
+        assert packed["torch_dtype_view"] is True
 
         unpacked = _unpack_if_shm_handle(packed)
         assert isinstance(unpacked, torch.Tensor)
         assert unpacked.dtype == torch.bfloat16
-        torch.testing.assert_close(unpacked, tensor)
+        assert torch.equal(unpacked, tensor)
     finally:
         _cleanup_shm_handle(packed)
 

@@ -903,10 +903,11 @@ def test_multiview_postprocess_releases_converted_view_before_next_camera(monkey
     converted_views = []
 
     class TrackingVideoProcessor(pipeline_module.VideoProcessor):
-        def postprocess_video(self, video, output_type="np"):
-            assert video.device.type == "cpu" and video.shape == (1, 3, 3, 4, 4)
+        def postprocess(self, image, output_type="pil", **kwargs):
+            # One camera's [T, C, H, W] frames per call.
+            assert image.device.type == "cpu" and image.shape == (3, 3, 4, 4)
             assert all(reference() is None for reference in converted_views)
-            result = super().postprocess_video(video, output_type=output_type)
+            result = super().postprocess(image, output_type=output_type, **kwargs)
             converted_views.append(weakref.ref(result))
             return result
 
@@ -1479,21 +1480,19 @@ def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
 
 
 def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("imageio.v3")
-    import imageio.v3 as iio
-
+    from vllm_omni.diffusion.utils import video_decode
     from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
 
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"placeholder")
     seen = {"n": 0}
 
-    def fake_imiter(_path):
+    def fake_frames(_path):
         for idx in range(20):
             seen["n"] += 1
             yield np.full((4, 4, 3), idx, dtype=np.uint8)
 
-    monkeypatch.setattr(iio, "imiter", fake_imiter)
+    monkeypatch.setattr(video_decode, "_iter_rgb_frames", fake_frames)
 
     first = decode_path_video_frames(source, max_frames=5, keep="first")
     assert len(first) == 5
@@ -1512,18 +1511,16 @@ def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypat
 def test_preprocess_v2v_video_path_honors_prompt_level_keep_and_indexes(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pytest.importorskip("imageio.v3")
-    import imageio.v3 as iio
-
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as cosmos_pipeline
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+    from vllm_omni.diffusion.utils import video_decode
     from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
 
     source = tmp_path / "vllm_omni_video_reference_prompt.mp4"
     source.write_bytes(b"placeholder")
     captured: dict[str, Any] = {}
 
-    def fake_imiter(_path):
+    def fake_frames(_path):
         for idx in range(20):
             yield np.full((16, 32, 3), idx, dtype=np.uint8)
 
@@ -1536,7 +1533,7 @@ def test_preprocess_v2v_video_path_honors_prompt_level_keep_and_indexes(
         captured["last"] = int(frames[-1][0, 0, 0])
         return frames
 
-    monkeypatch.setattr(iio, "imiter", fake_imiter)
+    monkeypatch.setattr(video_decode, "_iter_rgb_frames", fake_frames)
     monkeypatch.setattr(cosmos_pipeline, "decode_path_video_frames", spy_decode)
 
     preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
