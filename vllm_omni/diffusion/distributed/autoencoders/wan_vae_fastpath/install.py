@@ -73,6 +73,21 @@ def is_encoder_installed(vae: nn.Module) -> bool:
     return report is not None and report.installed
 
 
+# Devices on which cuDNN was verified to run every Wan decoder convolution with
+# bitwise-identical results for channels-first and channels-last operands (it
+# selects the same NDHWC kernel and only drops its layout transposes). Elsewhere
+# the lossless decoder keeps channels-first activations.
+_EXACT_CHANNELS_LAST_CAPABILITIES = frozenset({(9, 0)})
+
+
+def _exact_channels_last_supported(device: torch.device) -> bool:
+    return (
+        device.type == "cuda"
+        and torch.backends.cudnn.is_available()
+        and torch.cuda.get_device_capability(device) in _EXACT_CHANNELS_LAST_CAPABILITIES
+    )
+
+
 def _skip(level: str, reason: str) -> WanVaeFastPathReport:
     logger.info("Wan VAE fast path (%s) not installed: %s", level, reason)
     return WanVaeFastPathReport(level=level, installed=False, reason=reason)
@@ -218,12 +233,24 @@ def _install_bindings(
         fused_silu_dtypes = frozenset(
             dtype for dtype in (torch.bfloat16, torch.float16) if rn.silu_epilogue_is_exact(device, dtype)
         )
+    # The lossless decoder keeps channels-last activations where that is verified
+    # bit-exact, saving cuDNN's two layout transposes around every convolution.
+    exact_channels_last = (
+        level == "lossless"
+        and not encoder
+        and _exact_channels_last_supported(device)
+        # cuDNN picks layout-dependent algorithms for fp32 convolutions.
+        and all(p.dtype in (torch.float16, torch.bfloat16) for p in component.parameters())
+        # Verified for the residual (Wan 2.2) decoder only; the Wan 2.1 up blocks keep channels-first.
+        and any(type(module) is WanResidualUpBlock for module in component.modules())
+    )
     cfg = forwards.FastPathConfig(
         fused_silu_dtypes=fused_silu_dtypes,
-        channels_last=level == "channels_last",
+        channels_last=level == "channels_last" or exact_channels_last,
         clone_encoder_shortcuts=clone_encoder_shortcuts,
         fuse_norm_cache=encoder,
         exact_bf16_norm=encoder,
+        exact_channels_last=exact_channels_last,
     )
 
     with ExitStack() as rollback:
@@ -248,6 +275,27 @@ def _install_bindings(
 
         for module, replacement in bindings:
             bind(module, replacement)
+
+        if cfg.exact_channels_last:
+            # The decoder input keeps upstream's channels-first layout; every
+            # decoder convolution verifies its layout change per shape.
+            convs = [module for module in convs if module is not getattr(vae, "post_quant_conv", None)]
+            for module in convs:
+                original = {
+                    name: module.__dict__[name]
+                    for name in ("_conv_forward", forwards.CFG_ATTR)
+                    if name in module.__dict__
+                }
+
+                def restore(module: nn.Module = module, original: dict[str, Any] = original) -> None:
+                    module.__dict__.pop("_conv_forward", None)
+                    module.__dict__.pop(forwards.CFG_ATTR, None)
+                    module.__dict__.update(original)
+
+                rollback.callback(restore)
+                undo.append(restore)
+                module._conv_forward = MethodType(forwards.layout_checked_conv_forward, module)
+                setattr(module, forwards.CFG_ATTR, cfg)
 
         if cfg.channels_last:
             # Keep the original storage only until installation commits. An OOM

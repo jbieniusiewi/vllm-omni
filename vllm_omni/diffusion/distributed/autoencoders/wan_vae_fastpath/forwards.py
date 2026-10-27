@@ -33,7 +33,7 @@ Whenever a kernel declines an input, the reference expression is used.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from weakref import WeakKeyDictionary
 
@@ -58,6 +58,7 @@ from vllm_omni.diffusion.layers.vae_rms_norm import rms_norm_fastpath as shared_
 from . import triton_data_movement as dm
 from . import triton_norm_cache as nc
 from . import triton_rms_norm_cl as cl
+from . import triton_rms_norm_cl_exact as cle
 from . import triton_upsample as up
 from ._utils import suggests_channels_last
 
@@ -77,6 +78,9 @@ class FastPathConfig:
     fuse_norm_cache: bool = False
     # Keep the reference BF16 roundings in the channels-last norm (encoder only).
     exact_bf16_norm: bool = False
+    # Channels-last activations with the lossless numerics: the norm reproduces
+    # the channels-first reduction order and no tolerance-based rewrite runs.
+    exact_channels_last: bool = False
 
 
 def is_diffusers_rms_norm(module: Any) -> bool:
@@ -145,6 +149,12 @@ def rms_norm_fastpath(
         return None
 
     cfg = getattr(norm, CFG_ATTR, None)
+    if cfg is not None and cfg.exact_channels_last and _kernels_allowed(x):
+        out = cle.rms_norm_channels_last_exact(x, gamma, norm.scale, silu=silu, bias=bias)
+        if out is not None:
+            return out
+        # ATen reduces a channels-last tensor in another order; normalize the channels-first copy.
+        return shared_rms_norm_fastpath(norm, x.contiguous(), silu=silu, bias=bias)
     if cfg is not None and cfg.channels_last and _kernels_allowed(x):
         # Tier 2: one read, one write; not bit-exact (different reduction order).
         out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias, exact_bf16=cfg.exact_bf16_norm)
@@ -176,7 +186,7 @@ def _norm_act(
             type(act) is nn.SiLU
             and not act.inplace
             and not _has_forward_hooks(act)
-            and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
+            and (x.dtype in cfg.fused_silu_dtypes or (cfg.channels_last and not cfg.exact_channels_last))
         )
         out = rms_norm_fastpath(norm, x, silu=fuse, bias=pending_bias)
         if out is not None:
@@ -215,7 +225,11 @@ def causal_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.T
 
 def _conv_without_bias(conv: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
     """The cuDNN call ``nn.Conv3d.forward`` makes, minus ATen's separate ``add_(bias)``."""
-    return F.conv3d(x, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+    def run(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv3d(x, weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+    return _layout_checked_conv(conv, run, x, conv.weight, "no_bias")
 
 
 def _deferred_conv_bias(conv: nn.Module, output: torch.Tensor) -> torch.Tensor | None:
@@ -236,6 +250,9 @@ _SPATIAL_PAD_VERDICTS: WeakKeyDictionary[nn.Module, dict[tuple, bool]] = WeakKey
 # Per conv module: {(x.shape, cache_frames, dtype): the convolution of the channels-last
 # assembled input is bitwise identical to the channels-first one}.
 _CONV_OUT_LAYOUT_VERDICTS: WeakKeyDictionary[nn.Module, dict[tuple, bool]] = WeakKeyDictionary()
+# Per conv module of an exact channels-last decoder: {(verdict key, call site): convolving the
+# channels-last operands is bitwise identical to convolving their channels-first copies}.
+_EXACT_LAYOUT_VERDICTS: WeakKeyDictionary[nn.Module, dict[tuple, bool]] = WeakKeyDictionary()
 
 
 def _record_verdict(verdicts: dict[tuple, bool], key: tuple, verdict: bool) -> None:
@@ -292,6 +309,59 @@ def _equal_on_random_operands(
     return _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
 
 
+def _is_exact_channels_last(module: nn.Module) -> bool:
+    cfg = getattr(module, CFG_ATTR, None)
+    return cfg is not None and cfg.exact_channels_last
+
+
+def _layout_checked_conv(
+    conv: nn.Module,
+    run: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    site: str,
+) -> torch.Tensor:
+    """``run(x, weight)``; for an exact channels-last decoder, its channels-first formulation where that differs.
+
+    cuDNN computes channels-first convolutions by transposing to NDHWC around
+    the channels-last kernel, so dropping the transposes usually changes no
+    bits. Which kernel it selects depends only on the verdict key's metadata,
+    so the first call per (conv, shape, call site) compares both layouts on
+    seeded random operands; a mismatch routes that shape to channels-first
+    copies of the operands, whose result downstream kernels accept unchanged.
+    """
+    if not _is_exact_channels_last(conv) or (x.is_contiguous() and weight.is_contiguous()):
+        return run(x, weight)
+    verdicts = _EXACT_LAYOUT_VERDICTS.setdefault(conv, {})
+    key = (_conv_verdict_key(conv, x, 0), site)
+    verdict = verdicts.get(key)
+    if verdict is None:
+        verdict = _equal_on_random_operands(
+            x, weight, run, lambda x_cf, w: run(x_cf, w.contiguous()), lambda t: t.contiguous()
+        )
+        _record_verdict(verdicts, key, verdict)
+        if not verdict:
+            logger.info(
+                "channels-last %s is not bitwise identical to the channels-first one for %s; "
+                "using channels-first operands for this shape",
+                type(conv).__name__,
+                tuple(x.shape),
+            )
+    return run(x, weight) if verdict else run(x.contiguous(), weight.contiguous())
+
+
+def layout_checked_conv_forward(
+    self: nn.Module, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    """``_conv_forward`` of a convolution in an exact channels-last decoder (see :func:`_layout_checked_conv`)."""
+    conv_forward = type(self)._conv_forward
+
+    def run(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        return conv_forward(self, x, w, bias)
+
+    return _layout_checked_conv(self, run, input, weight, "module")
+
+
 def _conv_with_spatial_padding(
     conv: nn.Conv3d,
     assembled: torch.Tensor,
@@ -318,7 +388,12 @@ def _conv_with_spatial_padding(
     def pad(x: torch.Tensor) -> torch.Tensor:
         return F.pad(x, pads)
 
+    exact = _is_exact_channels_last(conv)
+
     def padded(x_padded: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        if exact:
+            # Exact channels-last decoders compare against (and fall back to) upstream's channels-first call.
+            x_padded, weight = x_padded.contiguous(), weight.contiguous()
         return F.conv3d(x_padded, weight, bias, conv.stride, 0, conv.dilation, conv.groups)
 
     verdict = verdicts.get(key)
@@ -373,6 +448,7 @@ def _first_frame_conv2d(
     if (
         cfg is None
         or not cfg.channels_last
+        or cfg.exact_channels_last
         or x.shape[2] != 1
         or x.dtype not in _NORM_DTYPES
         or conv.kernel_size not in ((3, 3, 3), (3, 1, 1))
@@ -456,7 +532,11 @@ def _run_cached_causal_conv(
         pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T)
         if pair is not None:
             conv_input, cache_list[index] = pair
-            out = F.conv3d(conv_input, conv.weight, bias, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+            def run(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+                return F.conv3d(x, weight, bias, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+            out = _layout_checked_conv(conv, run, conv_input, conv.weight, "pre_padded")
             return (out, _deferred_conv_bias(conv, out)) if return_bias else out
 
     cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -567,6 +647,7 @@ def _run_conv_out_channels_last(
     payload = cache if isinstance(cache, torch.Tensor) else None
     if (
         type(conv) is not WanCausalConv3d
+        or _is_exact_channels_last(conv)
         or _has_forward_hooks(conv)
         or not _kernels_allowed(x)
         or x.dim() != 5
@@ -745,7 +826,11 @@ def resample_forward(
         and _kernels_allowed(x)
     ):
         upsample, conv = self.resample[0], self.resample[1]
-        x = F.conv2d(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+        def run(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            return F.conv2d(x, weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+        x = _layout_checked_conv(conv, run, upsample(x), conv.weight, "no_bias")
         pending_bias = _deferred_conv_bias(conv, x)
     else:
         x = self.resample(x)
@@ -919,6 +1004,30 @@ def residual_up_block_forward(
     return x + shortcut(shortcut_source, first_chunk=first_chunk)
 
 
+def _upstream_runs_channels_first(x: torch.Tensor) -> bool:
+    """Whether upstream decodes ``x`` with channels-first activations throughout.
+
+    Channels-last latents keep upstream channels-last for batches above one,
+    and 1x1 latents make every activation pass both layout checks; ATen then
+    reduces some norms in the channels-last order, which only the
+    layout-mirroring channels-first path reproduces.
+    """
+    return x.dim() == 5 and x.shape[1] > 1 and x.shape[3] * x.shape[4] > 1 and not suggests_channels_last(x)
+
+
+def _demote_exact_channels_last(decoder: nn.Module, cfg: FastPathConfig) -> None:
+    """Switch an exact channels-last decoder to channels-first activations for good (see install)."""
+    channels_first = replace(cfg, channels_last=False, exact_channels_last=False)
+    for module in decoder.modules():
+        if module.__dict__.get(CFG_ATTR) is cfg:
+            setattr(module, CFG_ATTR, channels_first)
+        if isinstance(module, nn.Conv3d):
+            module.to(memory_format=torch.contiguous_format)
+        elif isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+            module.to(memory_format=torch.contiguous_format)
+    logger.info("Wan VAE decoder input is not channels-first; using channels-first activations from now on")
+
+
 def decoder_forward(
     self: WanDecoder3d,
     x: torch.Tensor,
@@ -928,6 +1037,9 @@ def decoder_forward(
 ) -> torch.Tensor:
     if feat_idx is None:
         feat_idx = [0]
+    cfg = getattr(self, CFG_ATTR, None)
+    if cfg is not None and cfg.exact_channels_last and not _upstream_runs_channels_first(x):
+        _demote_exact_channels_last(self, cfg)
     if feat_cache is not None:
         index = feat_idx[0]
         x = _run_cached_causal_conv(self.conv_in, x, feat_cache, index)
@@ -951,6 +1063,10 @@ def decoder_forward(
         feat_idx[0] += 1
     else:
         x = self.conv_out(x)
+    cfg = getattr(self, CFG_ATTR, None)
+    if cfg is not None and cfg.exact_channels_last:
+        # Lossless output keeps the channels-first layout of the reference decoder.
+        x = x.contiguous()
     return x
 
 
