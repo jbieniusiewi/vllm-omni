@@ -29,10 +29,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from vllm.distributed import get_tensor_model_parallel_world_size
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.cosmos3.fused_ops import head_rms_norm
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_attention import maskless_attention_streams
 from vllm_omni.diffusion.models.cosmos3.multiview_packing import (
     add_rig_view_embedding,
@@ -123,8 +123,8 @@ class Cosmos3NanoSimAutoJointAttention(Cosmos3CrossAttention):
         k = self.to_k(hidden_states).view(batch, seq_len, self.num_kv_heads_local, self.head_dim)
         v = self.to_v(hidden_states).view(batch, seq_len, self.num_kv_heads_local, self.head_dim)
         if self.qk_norm:
-            q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
-            k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
+            q = head_rms_norm(q, self.norm_q.weight, self.norm_q.variance_epsilon)
+            k = head_rms_norm(k, self.norm_k.weight, self.norm_k.variance_epsilon)
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
         local_len = seq_len
         if shard is not None:
