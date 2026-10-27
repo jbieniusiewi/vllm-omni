@@ -376,20 +376,26 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
             view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
             if guardrails_enabled:
                 view = check_video_safety(view)
-            processed_view = video_processor.postprocess_video(view, output_type=output_type)
-            if processed_video is None:
-                if output_type == "pil":
-                    processed_video = [[]]
-                else:
-                    output_shape = (1, video.shape[2], *processed_view.shape[2:])
-                    if output_type == "np":
-                        processed_video = np.empty(output_shape, dtype=processed_view.dtype)
-                    else:
-                        processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
             if output_type == "pil":
+                processed_view = video_processor.postprocess_video(view, output_type=output_type)
+                if processed_video is None:
+                    processed_video = [[]]
                 processed_video[0].extend(processed_view[0])
             else:
-                processed_video[:, frame_start : frame_start + frames_per_view] = processed_view
+                # postprocess_video's arithmetic (denormalize in the decoder dtype,
+                # then FP32 HWC for "np"), written straight into the output slice
+                # instead of through per-view stacked NumPy copies.
+                processed_view = video_processor.postprocess(view[0].permute(1, 0, 2, 3), output_type="pt")
+                if output_type == "np":
+                    processed_view = processed_view.permute(0, 2, 3, 1)
+                if processed_video is None:
+                    output_shape = (1, video.shape[2], *processed_view.shape[1:])
+                    if output_type == "np":
+                        processed_video = np.empty(output_shape, dtype=np.float32)
+                    else:
+                        processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
+                output = torch.from_numpy(processed_video) if output_type == "np" else processed_video
+                output[0, frame_start : frame_start + frames_per_view].copy_(processed_view)
             # Retaining converted clips and concatenating them would duplicate
             # the complete processed multiview output.
             del view, processed_view

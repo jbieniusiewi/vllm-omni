@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Decode video file paths to RGB frames.
 
-Path suffix checks and bounded first/last-N imageio decoding. Model-specific
+Path suffix checks and bounded first/last-N PyAV decoding. Model-specific
 conditioning and decode-budget stay in each pipeline's preprocess layer.
 
 Currently used by Cosmos3 V2V preprocess and transfer ``control_path``.
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,6 +50,30 @@ def _frame_to_uint8_rgb(value: Any) -> np.ndarray:
     raise TypeError(f"Video decode expected an RGB frame, got {type(value)!r}.")
 
 
+def _iter_rgb_frames(path: Path) -> Iterator[np.ndarray]:
+    """Decode ``path`` with PyAV as ``rgb24`` frames (H, W, C).
+
+    Same decoder settings and conversion as imageio's pyav plugin, without its
+    per-close ``gc.collect()``, which costs a full collection of the worker heap
+    for every decoded file.
+    """
+    import av
+
+    try:
+        with av.open(os.fspath(path)) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "SLICE"
+            stream.codec_context.thread_count = 0
+            for frame in container.decode(stream):
+                yield frame.to_ndarray(format="rgb24")
+    finally:
+        # PyAV keeps a swscale worker pool on a private thread-local that outlives
+        # the container and can deadlock a later fork; dropping it joins the workers.
+        thread_local = getattr(av.video.frame, "_thread_local", None)
+        if getattr(thread_local, "reformatter", None) is not None:
+            del thread_local.reformatter
+
+
 def decode_path_video_frames(
     path: str | Path,
     *,
@@ -67,25 +92,22 @@ def decode_path_video_frames(
         raise ValueError("Video keep must be either 'first' or 'last'.")
     if max_frames is not None and int(max_frames) <= 0:
         raise ValueError("Video max_frames must be positive.")
-    try:
-        import imageio.v3 as iio
-    except ImportError as exc:
-        raise ImportError(
-            "Video path decoding requires imageio. Install imageio[ffmpeg] or provide decoded frames."
-        ) from exc
-
     limit = None if max_frames is None else int(max_frames)
     if keep == "last" and limit is not None:
         window: deque[np.ndarray] = deque(maxlen=limit)
-        for frame in iio.imiter(media_path):
+        for frame in _iter_rgb_frames(media_path):
             window.append(_frame_to_uint8_rgb(frame))
         frames = list(window)
     else:
         frames = []
-        for frame in iio.imiter(media_path):
-            frames.append(_frame_to_uint8_rgb(frame))
-            if limit is not None and len(frames) >= limit:
-                break
+        decoder = _iter_rgb_frames(media_path)
+        try:
+            for frame in decoder:
+                frames.append(_frame_to_uint8_rgb(frame))
+                if limit is not None and len(frames) >= limit:
+                    break
+        finally:
+            decoder.close()
     if not frames:
         raise ValueError(f"Video path produced no frames: {media_path}")
     return frames

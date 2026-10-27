@@ -24,6 +24,7 @@ import json
 import math
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, ClassVar
 
@@ -423,15 +424,31 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         width: int,
         num_frames: int,
     ) -> torch.Tensor:
-        """Encode one media field of every camera independently: ``[1, C, V*T_lat, h, w]``."""
-        latents = []
-        for view in views:
+        """Encode one media field of every camera independently: ``[1, C, V*T_lat, h, w]``.
+
+        The host-side decode/resize/normalize of the next camera runs on a helper
+        thread while the current camera is VAE-encoded on the device.
+        """
+
+        def load(view: Mapping[str, Any]) -> torch.Tensor:
             value = self._view_value(view, field)
             if value is None:
                 raise ValueError(f"Camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(value, height=height, width=width, max_frames=num_frames)
             frames = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
-            latents.append(self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)))
+            return uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)
+
+        latents = []
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cosmos3-sim-auto-media") as loader:
+            upcoming = iter(views)
+            following = next(upcoming, None)
+            pending = None if following is None else loader.submit(load, following)
+            while pending is not None:
+                video = pending.result()
+                following = next(upcoming, None)
+                pending = None if following is None else loader.submit(load, following)
+                latents.append(self._encode_video_tensor(video))
+                del video
         lengths = {int(latent.shape[2]) for latent in latents}
         if len(lengths) != 1:
             raise ValueError(f"Per-camera VAE encodes have unequal latent lengths: {lengths}.")
