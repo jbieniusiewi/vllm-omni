@@ -186,13 +186,17 @@ _KERNEL_OPTIONS = {
     "BLOCK_M": 64,
     "BLOCK_N": 64,
     "num_warps": 4,
-    "num_stages": 1,
+    "num_stages": 2,
     "USE_TMA": False,
     "FORCE_USE_FLEX_ATTENTION": True,
     # Triton's dot precision is local to this operator, including the P @ V
     # multiplication. Do not change the surrounding model's TF32 policy.
     "FLOAT32_PRECISION": "'ieee'",
 }
+# FP32 64x64 tiles with head_dim > 32 exhaust four warps' registers (about 10x
+# slower on H200). Warps and pipeline stages only change the schedule, not
+# the per-row reduction order of the 64x64 blocks, so outputs are identical.
+_WIDE_HEAD_KERNEL_OPTIONS = {**_KERNEL_OPTIONS, "num_warps": 8}
 
 
 def _attention_pair(value, name: str) -> tuple[int, int]:
@@ -276,7 +280,8 @@ def _run_attention(query, key, value, block_mask, scale):
     # preserves Q @ K and P @ V with an explicit scale.
     if head_dim < 16:
         query, key, value = (F.pad(t, (0, 16 - head_dim)) for t in (query, key, value))
-    output = flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=_KERNEL_OPTIONS)
+    options = _KERNEL_OPTIONS if query.shape[-1] <= 32 else _WIDE_HEAD_KERNEL_OPTIONS
+    output = flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=options)
     return output[..., :head_dim] if head_dim < 16 else output
 
 
@@ -744,19 +749,63 @@ class TemporalBlock(nn.Module):
         self.temporal_attn = CausalTemporalAttention(in_dim, num_heads)
         self.ffn = FeedForwardNetwork(in_dim, int(in_dim * mlp_ratio))
 
+    @staticmethod
+    def _in_layout_of(x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        return h if x.is_contiguous() else torch.empty_like(x).copy_(h)
+
+    # Callers pass (BHW, T, C) views of frame-major activations. A linear layer
+    # on such a view runs as a batched GEMM against a per-position copy of the
+    # weight (over 2x slower), so the block runs on a contiguous copy and
+    # returns its output in the input's layout; values are unchanged.
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.temporal_attn(x)
-        x = self.ffn(x)
-        return x
+        h = self.temporal_attn(x.contiguous())
+        h = self.ffn(h)
+        return self._in_layout_of(x, h)
 
     def forward_stream(
         self,
         x: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        x, kv_cache = self.temporal_attn.forward_stream(x, kv_cache)
-        x = self.ffn(x)
-        return x, kv_cache
+        h, kv_cache = self.temporal_attn.forward_stream(x.contiguous(), kv_cache)
+        h = self.ffn(h)
+        return self._in_layout_of(x, h), kv_cache
+
+
+#: Query frames per SDPA call of the frame-causal joint 3D attention.
+_JOINT3D_QUERY_FRAMES = 2
+
+
+def _frame_causal_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, tokens_per_frame: int) -> torch.Tensor:
+    """SDPA of the last query frames over ``k``/``v``; each query frame sees keys up to its own frame.
+
+    ``q``/``k``/``v`` are ``[B, N, frames * tokens_per_frame, D]``. Instead of
+    one call with a dense frame-causal mask, the query frames run in groups
+    over the key prefix the group can see. The dropped keys are masked for
+    every row of the group, and a masked key adds exact zeros to the softmax
+    sums and the output, so every row is bit-identical while roughly half of
+    the score tiles are skipped.
+    """
+    per_frame = tokens_per_frame
+    query_frames, key_frames = q.shape[2] // per_frame, k.shape[2] // per_frame
+    past = key_frames - query_frames
+    batch, heads, tokens, dim = q.shape
+    # The layout SDPA's memory-efficient kernel returns, so the caller's reshape stays a view.
+    out = q.new_empty(batch, tokens, heads, dim).transpose(1, 2)
+    for start in range(0, query_frames, _JOINT3D_QUERY_FRAMES):
+        stop = min(start + _JOINT3D_QUERY_FRAMES, query_frames)
+        keys = (past + stop) * per_frame
+        t_q = torch.arange(past + start, past + stop, device=q.device).repeat_interleave(per_frame)
+        t_k = torch.arange(past + stop, device=q.device).repeat_interleave(per_frame)
+        out[:, :, start * per_frame : stop * per_frame] = F.scaled_dot_product_attention(
+            q[:, :, start * per_frame : stop * per_frame],
+            k[:, :, :keys],
+            v[:, :, :keys],
+            attn_mask=t_k.unsqueeze(0) <= t_q.unsqueeze(1),
+            scale=1.0,
+        )
+    return out
 
 
 class Joint3DSelfAttention(nn.Module):
@@ -820,10 +869,7 @@ class Joint3DSelfAttention(nn.Module):
         k = einops.rearrange(k, "B S N D -> B N S D")
         v = einops.rearrange(v, "B S N D -> B N S D")
 
-        S = H * W
-        t_idx = torch.arange(T, device=q.device).repeat_interleave(S)
-        mask = t_idx.unsqueeze(0) <= t_idx.unsqueeze(1)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=1.0)
+        out = _frame_causal_sdpa(q, k, v, tokens_per_frame=H * W)
         out = einops.rearrange(out, "B N (T H W) D -> B T H W (N D)", T=T, H=H, W=W)
         return self.out_proj(out)
 
@@ -901,12 +947,10 @@ class Joint3DSelfAttention(nn.Module):
         # memory-efficient backend; at LiDAR resolution the dense mask alone can
         # otherwise consume several GiB. Multi-frame chunks still need temporal
         # causality between their newly appended frames.
-        mask = None
         if T_new > 1:
-            t_q = torch.arange(T_total - T_new, T_total, device=q.device).repeat_interleave(S)
-            t_k = torch.arange(T_total, device=q.device).repeat_interleave(S)
-            mask = t_k.unsqueeze(0) <= t_q.unsqueeze(1)  # (T_new*S, T_total*S)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=1.0)
+            out = _frame_causal_sdpa(q, k, v, tokens_per_frame=S)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, scale=1.0)
         out = einops.rearrange(out, "B N (T H W) D -> B T H W (N D)", T=T_new, H=H, W=W)
         out = self.out_proj(out)
         return x + out, (k_all.detach(), v_all.detach())
