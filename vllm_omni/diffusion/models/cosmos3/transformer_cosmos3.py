@@ -48,6 +48,7 @@ from vllm_omni.quantization.component_config import (
     resolve_component_quant_config,
 )
 
+from .fused_ops import head_rms_norm, try_fused_rotary_pos_emb, try_fused_silu_mul
 from .mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
@@ -464,6 +465,9 @@ def _apply_rotary_pos_emb(
         cos: [1, S, 1, D] or broadcastable
         sin: [1, S, 1, D] or broadcastable
     """
+    fused = try_fused_rotary_pos_emb(q, k, cos, sin)
+    if fused is not None:
+        return fused
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
@@ -540,7 +544,9 @@ class Cosmos3GatedMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        hidden = try_fused_silu_mul(gate, up)
+        return self.down_proj(F.silu(gate) * up if hidden is None else hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +647,8 @@ class Cosmos3CausalAttention(nn.Module):
         v = self.to_v(hidden_states).view(B, S, self.num_kv_heads_local, self.head_dim)
 
         # Per-head QK norm
-        q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
+        q = head_rms_norm(q, self.norm_q.weight, self.norm_q.variance_epsilon)
+        k = head_rms_norm(k, self.norm_k.weight, self.norm_k.variance_epsilon)
 
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -914,8 +920,8 @@ class Cosmos3CrossAttention(nn.Module):
 
         # Per-head QK norm
         if self.qk_norm:
-            q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
-            k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
+            q = head_rms_norm(q, self.norm_q.weight, self.norm_q.variance_epsilon)
+            k = head_rms_norm(k, self.norm_k.weight, self.norm_k.variance_epsilon)
 
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
