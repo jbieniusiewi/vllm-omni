@@ -24,7 +24,10 @@ import json
 import math
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import partial
+from itertools import islice
 from typing import Any, ClassVar
 
 import torch
@@ -104,6 +107,9 @@ from .transformer_cosmos3_nano_sim_auto import (
 )
 
 logger = init_logger(__name__)
+
+#: CPU threads decoding camera media while the GPU encodes the LiDAR stream and earlier cameras.
+_MEDIA_LOAD_THREADS = 2
 
 _SYSTEM_PROMPTS = {
     "av_multiview_transfer": COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
@@ -414,38 +420,28 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
     def _view_value(view: Mapping[str, Any], field: str) -> Any:
         return view.get(f"{field}_path", view.get(field))
 
-    def _encode_camera_major(
-        self,
-        views: Sequence[Mapping[str, Any]],
-        *,
-        field: str,
-        height: int,
-        width: int,
-        num_frames: int,
+    def _view_pixels(
+        self, view: Mapping[str, Any], *, field: str, height: int, width: int, num_frames: int
     ) -> torch.Tensor:
-        """Encode one media field of every camera independently: ``[1, C, V*T_lat, h, w]``."""
-        latents = []
-        for view in views:
-            value = self._view_value(view, field)
-            if value is None:
-                raise ValueError(f"Camera {view['camera_key']!r} is missing {field} input.")
-            frames = media_to_uint8_cthw(value, height=height, width=width, max_frames=num_frames)
-            frames = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
-            latents.append(self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)))
+        """One camera's media field as the normalized pixel clip ``[1, 3, num_frames, H, W]`` (CPU work only)."""
+        value = self._view_value(view, field)
+        if value is None:
+            raise ValueError(f"Camera {view['camera_key']!r} is missing {field} input.")
+        frames = media_to_uint8_cthw(value, height=height, width=width, max_frames=num_frames)
+        frames = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+        return uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)
+
+    def _encode_camera_major(self, clips: Iterable[torch.Tensor]) -> torch.Tensor:
+        """Encode every camera's pixel clip independently: ``[1, C, V*T_lat, h, w]``."""
+        latents = [self._encode_video_tensor(clip) for clip in clips]
         lengths = {int(latent.shape[2]) for latent in latents}
         if len(lengths) != 1:
             raise ValueError(f"Per-camera VAE encodes have unequal latent lengths: {lengths}.")
         return torch.cat(latents, dim=2)
 
-    def _encode_first_frames(self, views: Sequence[Mapping[str, Any]], *, height: int, width: int) -> torch.Tensor:
+    def _encode_first_frames(self, clips: Iterable[torch.Tensor]) -> torch.Tensor:
         """Latent 0 of every camera from its first RGB frame (the causal Wan encoder makes it exact)."""
-        latents = []
-        for view in views:
-            value = self._view_value(view, "vision")
-            frames = media_to_uint8_cthw(value, height=height, width=width, max_frames=1)
-            frames = _pad_multiview_view_video(frames, num_frames=1, height=height, width=width)
-            latents.append(self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype))[:, :, :1])
-        return torch.cat(latents, dim=2)
+        return torch.cat([self._encode_video_tensor(clip)[:, :, :1] for clip in clips], dim=2)
 
     def _encode_lidar_condition(self, lidar_request: Mapping[str, Any], *, num_sweeps: int) -> torch.Tensor:
         assert self.lidar_encoder is not None
@@ -693,31 +689,49 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                     f"pool chunk={spec.chunk_size}, block={bound.kv_cache.block_size}, request frame unit={frame_unit}."
                 )
 
-        control = self._encode_camera_major(views, field="control", height=height, width=width, num_frames=num_frames)
-        if control.shape[2] != num_views * latents_per_view:
-            raise RuntimeError(
-                f"WSM control latents hold {control.shape[2]} frames, expected {num_views * latents_per_view}."
-            )
-        target = torch.zeros_like(control)
-        condition_frames: frozenset[int] = frozenset()
+        # Camera media decode/resize is CPU work: start every clip now, in encode
+        # order, so it runs behind the LiDAR encode and the earlier cameras' VAE.
+        loads = [
+            partial(self._view_pixels, view, field="control", height=height, width=width, num_frames=num_frames)
+            for view in views
+        ]
         if has_condition:
-            first = self._encode_first_frames(views, height=height, width=width)  # [1, C, V, h, w]
-            target.view(1, target.shape[1], num_views, latents_per_view, *target.shape[3:])[:, :, :, 0] = first.to(
-                target.dtype
-            )
-            condition_frames = frozenset({0})
+            loads += [
+                partial(self._view_pixels, view, field="vision", height=height, width=width, num_frames=1)
+                for view in views
+            ]
+        pool = ThreadPoolExecutor(max_workers=_MEDIA_LOAD_THREADS, thread_name_prefix="cosmos3-media")
+        try:
+            clips = (future.result() for future in [pool.submit(load) for load in loads])
 
-        lidar_control = lidar_target = None
-        lidar_condition_sweeps: frozenset[int] = frozenset()
-        if joint:
-            assert self.lidar_encoder is not None and lidar_request is not None and sweeps is not None
-            frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
-            lidar_control = self.lidar_encoder(frames).to(device=self.device, dtype=self.sampling_dtype)
-            del frames
-            lidar_target = torch.zeros_like(lidar_control)
-            if lidar_condition:
-                lidar_target[:, :, :1] = self._encode_lidar_condition(lidar_request, num_sweeps=sweeps)
-                lidar_condition_sweeps = frozenset({0})
+            lidar_control = lidar_target = None
+            lidar_condition_sweeps: frozenset[int] = frozenset()
+            if joint:
+                assert self.lidar_encoder is not None and lidar_request is not None and sweeps is not None
+                frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
+                lidar_control = self.lidar_encoder(frames).to(device=self.device, dtype=self.sampling_dtype)
+                del frames
+                lidar_target = torch.zeros_like(lidar_control)
+                if lidar_condition:
+                    lidar_target[:, :, :1] = self._encode_lidar_condition(lidar_request, num_sweeps=sweeps)
+                    lidar_condition_sweeps = frozenset({0})
+
+            control = self._encode_camera_major(islice(clips, num_views))
+            if control.shape[2] != num_views * latents_per_view:
+                raise RuntimeError(
+                    f"WSM control latents hold {control.shape[2]} frames, expected {num_views * latents_per_view}."
+                )
+            target = torch.zeros_like(control)
+            condition_frames: frozenset[int] = frozenset()
+            if has_condition:
+                first = self._encode_first_frames(islice(clips, num_views))  # [1, C, V, h, w]
+                target.view(1, target.shape[1], num_views, latents_per_view, *target.shape[3:])[:, :, :, 0] = first.to(
+                    target.dtype
+                )
+                condition_frames = frozenset({0})
+        finally:
+            # Unconsumed clips (an earlier failure) are dropped rather than decoded.
+            pool.shutdown(wait=True, cancel_futures=True)
 
         # Captions: one causal UND pass per camera (positions rewound to zero); the
         # sink document is the caption's own first tokens, so its K/V are a prefix slice.
