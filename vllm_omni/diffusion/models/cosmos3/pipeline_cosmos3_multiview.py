@@ -22,6 +22,7 @@ from diffusers.video_processor import VideoProcessor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.utils.host_copy import PinnedHostCopier
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS,
@@ -602,23 +603,27 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 f"shape={tuple(camera_major_latents.shape)}, V={num_views}, F={latent_frames_per_view}."
             )
         decoded_output = None
-        for view in range(num_views):
-            decoded_view = self._decode_latents(
-                camera_major_latents.narrow(2, view * latent_frames_per_view, latent_frames_per_view)
-            )
-            if decoded_view.ndim != 5 or decoded_view.shape[2] <= 0:
-                raise ValueError("Cosmos3 multiview VAE decode must return non-empty [B, C, F, H, W] clips.")
-            if decoded_output is None:
-                view_shape = decoded_view.shape
-                frames_per_view = view_shape[2]
-                output_shape = (*view_shape[:2], num_views * frames_per_view, *view_shape[3:])
-                decoded_output = torch.empty(output_shape, dtype=decoded_view.dtype, device="cpu")
-            elif decoded_view.shape != view_shape or decoded_view.dtype != decoded_output.dtype:
-                raise ValueError("Cosmos3 multiview VAE decoded camera clips must have matching shapes and dtypes.")
-            # Copy each camera before decoding the next: retaining the GPU clips
-            # and concatenating them would require two full multiview videos.
-            decoded_output.narrow(2, view * frames_per_view, frames_per_view).copy_(decoded_view)
-            del decoded_view
+        with PinnedHostCopier(thread_name_prefix="cosmos3-multiview-d2h") as copier:
+            for view in range(num_views):
+                decoded_view = self._decode_latents(
+                    camera_major_latents.narrow(2, view * latent_frames_per_view, latent_frames_per_view)
+                )
+                if decoded_view.ndim != 5 or decoded_view.shape[2] <= 0:
+                    raise ValueError("Cosmos3 multiview VAE decode must return non-empty [B, C, F, H, W] clips.")
+                if decoded_output is None:
+                    view_shape = decoded_view.shape
+                    frames_per_view = view_shape[2]
+                    output_shape = (*view_shape[:2], num_views * frames_per_view, *view_shape[3:])
+                    decoded_output = torch.empty(output_shape, dtype=decoded_view.dtype, device="cpu")
+                elif decoded_view.shape != view_shape or decoded_view.dtype != decoded_output.dtype:
+                    raise ValueError(
+                        "Cosmos3 multiview VAE decoded camera clips must have matching shapes and dtypes."
+                    )
+                # Copy each camera before decoding the next: retaining the GPU clips
+                # and concatenating them would require two full multiview videos.
+                # The copy overlaps the next camera's decode.
+                copier.copy(decoded_output.narrow(2, view * frames_per_view, frames_per_view), decoded_view)
+                del decoded_view
 
         assert decoded_output is not None
         return decoded_output
