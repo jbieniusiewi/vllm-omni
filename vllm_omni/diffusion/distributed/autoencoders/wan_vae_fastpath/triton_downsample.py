@@ -154,6 +154,63 @@ def _supported(x: torch.Tensor) -> bool:
     )
 
 
+if HAS_TRITON:
+
+    @triton.jit
+    def _avg_down_gather_cl_kernel(
+        X,
+        OUT,
+        T_OUT,
+        H_OUT,
+        W_OUT,
+        PAD_T,
+        S0,
+        S2,
+        S3,
+        C: tl.constexpr,
+        FT: tl.constexpr,
+        FS: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        BLOCK_W: tl.constexpr,
+    ):
+        """``(BLOCK_C, BLOCK_W)`` tile of ``F.pad(x).view(...).permute(0, 1, 3, 5, 7, 2, 4, 6)`` made contiguous.
+
+        Reads channel-contiguous pixels of the channels-last input and writes
+        rows contiguous along ``w``; grid ``(w_blocks * c_blocks, H_OUT, B * FT * FS * FS * T_OUT)``.
+        """
+        c_blocks: tl.constexpr = (C + BLOCK_C - 1) // BLOCK_C
+        pid0 = tl.program_id(0)
+        cb = pid0 % c_blocks
+        wb = pid0 // c_blocks
+        h = tl.program_id(1).to(tl.int64)
+        plane = tl.program_id(2).to(tl.int64)
+        t = plane % T_OUT
+        rest = plane // T_OUT
+        k = rest % FS
+        rest = rest // FS
+        j = rest % FS
+        rest = rest // FS
+        i = rest % FT
+        b = rest // FT
+        c = cb * BLOCK_C + tl.arange(0, BLOCK_C)
+        w = wb * BLOCK_W + tl.arange(0, BLOCK_W)
+        c_mask = c < C
+        w_mask = w < W_OUT
+        t_in = t * FT + i - PAD_T
+        valid = t_in >= 0
+        src = X + b * S0 + t_in * S2 + (h * FS + j) * S3 + (w[None, :] * FS + k) * C + c[:, None]
+        v = tl.load(src, mask=c_mask[:, None] & w_mask[None, :] & valid, other=0.0)
+        # Output dims (B, C, FT, FS, FS, T_OUT, H_OUT, W_OUT), contiguous.
+        spatial = T_OUT * H_OUT * W_OUT
+        dst = (
+            OUT
+            + ((b * C + c[:, None]) * (FT * FS * FS) + (i * FS + j) * FS + k) * spatial
+            + (t * H_OUT + h) * W_OUT
+            + w[None, :]
+        )
+        tl.store(dst, v, mask=c_mask[:, None] & w_mask[None, :])
+
+
 def spatial_downsample_input(x: torch.Tensor) -> torch.Tensor | None:
     """Merge batch/frames and pad right/bottom by one, without an intermediate copy.
 
@@ -247,5 +304,49 @@ def avg_down3d_add(
             BLOCK=block,
             num_warps=_WARPS,
             enable_fp_fusion=False,
+        )
+    return out
+
+
+def avg_down3d_gather(x: torch.Tensor, factor_t: int, factor_s: int) -> torch.Tensor | None:
+    """The contiguous tensor ``AvgDown3D`` reduces, gathered from a channels-last ``x``; ``None`` to decline.
+
+    Equals ``F.pad(x, (0, 0, 0, 0, pad_t, 0)).view(...).permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()``
+    of upstream's forward, shape ``(B, C, ft, fs, fs, T', H', W')``. Only bytes
+    move, so the ATen mean over it is unchanged; reading channel-contiguous
+    pixels avoids ATen's strided 8D copy of a channels-last source.
+    """
+    if not _supported(x) or x.shape[1] < 2 or not x.is_contiguous(memory_format=torch.channels_last_3d):
+        return None
+    b, c, t_in, h_in, w_in = x.shape
+    if factor_t < 1 or factor_s < 1 or h_in % factor_s or w_in % factor_s:
+        return None
+    pad_t = (factor_t - t_in % factor_t) % factor_t
+    t, h, w = (t_in + pad_t) // factor_t, h_in // factor_s, w_in // factor_s
+    planes = b * factor_t * factor_s * factor_s * t
+    if h > _MAX_GRID_YZ or planes > _MAX_GRID_YZ:
+        return None
+    out = torch.empty((b, c, factor_t, factor_s, factor_s, t, h, w), dtype=x.dtype, device=x.device)
+    if out.numel() == 0:
+        return None
+    block_c = min(64, triton.next_power_of_2(c))
+    block_w = _BLOCK // block_c
+    with torch.accelerator.device_index(x.device.index):
+        _avg_down_gather_cl_kernel[(triton.cdiv(w, block_w) * triton.cdiv(c, block_c), h, planes)](
+            x,
+            out,
+            t,
+            h,
+            w,
+            pad_t,
+            x.stride(0),
+            x.stride(2),
+            x.stride(3),
+            C=c,
+            FT=factor_t,
+            FS=factor_s,
+            BLOCK_C=block_c,
+            BLOCK_W=block_w,
+            num_warps=_WARPS,
         )
     return out

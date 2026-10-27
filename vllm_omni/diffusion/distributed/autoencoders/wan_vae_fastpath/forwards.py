@@ -590,7 +590,7 @@ def _run_norm_act_cached_conv(
         and norm.gamma.ndim == 4
         and type(act) is nn.SiLU
         and not act.inplace
-        and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
+        and (x.dtype in cfg.fused_silu_dtypes or (cfg.channels_last and not cfg.exact_channels_last))
         and type(conv) is WanCausalConv3d
         and not _has_forward_hooks(norm, act, conv)
         and _can_bypass_dropout(after_norm)
@@ -604,16 +604,28 @@ def _run_norm_act_cached_conv(
             verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
             key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
             if verdicts.get(key, True):
-                pair = nc.norm_act_cat_time(
-                    x,
-                    norm.gamma,
-                    norm.scale,
-                    payload,
-                    conv._padding[4],
-                    channels_last=cfg.channels_last,
-                    silu=True,
-                    bias=pending_bias,
-                )
+                if cfg.exact_channels_last:
+                    pair = cle.norm_act_cat_time_exact(
+                        x,
+                        norm.gamma,
+                        norm.scale,
+                        payload,
+                        conv._padding[4],
+                        silu=True,
+                        bias=pending_bias,
+                        keep_cache_frames=CACHE_T,
+                    )
+                else:
+                    pair = nc.norm_act_cat_time(
+                        x,
+                        norm.gamma,
+                        norm.scale,
+                        payload,
+                        conv._padding[4],
+                        channels_last=cfg.channels_last,
+                        silu=True,
+                        bias=pending_bias,
+                    )
                 if pair is not None:
                     assembled, cache_list[index] = pair
                     out = _conv_with_spatial_padding(conv, assembled, None if return_bias else conv.bias, verdicts, key)
@@ -1016,7 +1028,7 @@ def _upstream_runs_channels_first(x: torch.Tensor) -> bool:
 
 
 def _demote_exact_channels_last(decoder: nn.Module, cfg: FastPathConfig) -> None:
-    """Switch an exact channels-last decoder to channels-first activations for good (see install)."""
+    """Switch an exact channels-last decoder (or encoder) to channels-first activations for good (see install)."""
     channels_first = replace(cfg, channels_last=False, exact_channels_last=False)
     for module in decoder.modules():
         if module.__dict__.get(CFG_ATTR) is cfg:
@@ -1025,7 +1037,10 @@ def _demote_exact_channels_last(decoder: nn.Module, cfg: FastPathConfig) -> None
             module.to(memory_format=torch.contiguous_format)
         elif isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
             module.to(memory_format=torch.contiguous_format)
-    logger.info("Wan VAE decoder input is not channels-first; using channels-first activations from now on")
+    logger.info(
+        "Wan VAE %s input is not channels-first; using channels-first activations from now on",
+        type(decoder).__name__,
+    )
 
 
 def decoder_forward(

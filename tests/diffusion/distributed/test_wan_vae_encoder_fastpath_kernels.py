@@ -23,6 +23,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import encode
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_downsample as down
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_norm_cache as nc
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_rms_norm_cl_exact as cle
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import encoder_nrmse_limit
 
 pytestmark = [
@@ -445,16 +446,17 @@ def test_encoder_norm_cache_fusion_adds_no_posterior_drift(monkeypatch, dtype, l
     expected = encode_frames(vae, x)
     for module, cfg in configs:
         setattr(module, fp.CFG_ATTR, cfg)
-    fused = nc.norm_act_cat_time
     hits = []
+    # Exact channels-last encoders (sm90) assemble through the ATen-order kernel instead.
+    for module, name in ((nc, "norm_act_cat_time"), (cle, "norm_act_cat_time_exact")):
 
-    def record(*args, **kwargs):
-        pair = fused(*args, **kwargs)
-        if pair is not None:
-            hits.append(args[0].shape)
-        return pair
+        def record(*args, _fused=getattr(module, name), **kwargs):
+            pair = _fused(*args, **kwargs)
+            if pair is not None:
+                hits.append(args[0].shape)
+            return pair
 
-    monkeypatch.setattr(nc, "norm_act_cat_time", record)
+        monkeypatch.setattr(module, name, record)
     actual = encode_frames(vae, x)
     bits_equal(actual, expected)
     if level == "channels_last" or dtype in configs[0][1].fused_silu_dtypes:
@@ -491,3 +493,53 @@ def test_norm_cache_history_across_fusion_and_fallback(monkeypatch, dtype, chann
         actual = fp._run_norm_act_cached_conv(norm, torch.nn.SiLU(), conv, x, cache, 0, pending_bias=bias)
         bits_equal(actual, expected)
         bits_equal(cache[0], reference_cache[0])
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("frames,factor_t", [(1, 1), (4, 2), (5, 2), (1, 2)])
+def test_avg_down3d_gather_matches_upstream_permute_copy(dtype, frames, factor_t):
+    source = torch.randn(1, 40, frames, 12, 18, device="cuda", dtype=dtype)
+    shortcut = AvgDown3D(40, 80 if factor_t == 1 else 160, factor_t=factor_t, factor_s=2)
+    gathered = down.avg_down3d_gather(source.contiguous(memory_format=torch.channels_last_3d), factor_t, 2)
+    assert gathered is not None and gathered.is_contiguous()
+    pad_t = (factor_t - frames % factor_t) % factor_t
+    padded = F.pad(source, (0, 0, 0, 0, pad_t, 0))
+    b, c, t, h, w = padded.shape
+    expected = padded.view(b, c, t // factor_t, factor_t, h // 2, 2, w // 2, 2).permute(0, 1, 3, 5, 7, 2, 4, 6)
+    bits_equal(gathered, expected.contiguous())
+    _, _, _, _, _, t, h, w = gathered.shape
+    reduced = gathered.view(b, shortcut.out_channels, shortcut.group_size, t, h, w).mean(dim=2)
+    bits_equal(reduced, shortcut(source))
+    # Channels-first sources keep upstream's forward.
+    assert down.avg_down3d_gather(source, factor_t, 2) is None
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("history", [None, 1, 2])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_exact_norm_cat_time_matches_channels_last_norm(history, with_bias):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
+
+    torch.manual_seed(0)
+    norm = WanRMS_norm(160, images=False).to(device="cuda", dtype=torch.bfloat16)
+    norm.gamma.normal_()
+    x = torch.randn(1, 160, 4, 24, 40, device="cuda", dtype=torch.bfloat16)
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    cache = None
+    if history is not None:
+        cache = torch.randn(1, 160, history, 24, 40, device="cuda", dtype=torch.bfloat16)
+        cache = cache.contiguous(memory_format=torch.channels_last_3d)
+    bias = torch.randn(160, device="cuda").to(torch.bfloat16) if with_bias else None
+    pair = cle.norm_act_cat_time_exact(x, norm.gamma, norm.scale, cache, 2, silu=True, bias=bias)
+    assert pair is not None
+    out, keep = pair
+    normed = cle.rms_norm_channels_last_exact(x, norm.gamma, norm.scale, silu=True, bias=bias)
+    front = torch.zeros(1, 160, 2, 24, 40, device="cuda", dtype=torch.bfloat16)
+    if cache is not None:
+        front[:, :, 2 - history :] = cache
+    expected = torch.cat([front, normed], dim=2)
+    assert out.is_contiguous(memory_format=torch.channels_last_3d)
+    bits_equal(out, expected)
+    bits_equal(keep, expected[:, :, -2:])
+    assert keep.is_contiguous(memory_format=torch.channels_last_3d)
