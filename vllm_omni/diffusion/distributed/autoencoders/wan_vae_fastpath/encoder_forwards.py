@@ -30,8 +30,22 @@ def quant_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.Te
     otherwise carry channels-last strides on every encode path. The latent is
     small, so the copy is negligible; already-contiguous outputs are returned
     unchanged. The decoder's ``conv_out`` restores its layout the same way.
+    Lossless channels-last weights also keep the reference's strides of
+    singleton dimensions (1x1 latents), which ``contiguous()`` alone ignores.
     """
-    return fp.causal_conv_forward(self, x, cache_x).contiguous()
+    out = fp.causal_conv_forward(self, x, cache_x)
+    if fp._is_exact_channels_last(self):
+        return out.clone(memory_format=torch.contiguous_format) if out.stride() != _dense_strides(out) else out
+    return out.contiguous()
+
+
+def _dense_strides(x: torch.Tensor) -> tuple[int, ...]:
+    """The strides of a freshly allocated channels-first tensor of ``x``'s shape."""
+    strides, step = [], 1
+    for size in reversed(x.shape):
+        strides.append(step)
+        step *= max(size, 1)
+    return tuple(reversed(strides))
 
 
 def is_spatial_downsample(module: WanResample) -> bool:
@@ -118,10 +132,27 @@ def residual_down_block_forward(
         x = self.downsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
 
     shortcut = self.avg_shortcut
-    if cfg is not None and cfg.channels_last and type(shortcut) is AvgDown3D and not fp._has_forward_hooks(shortcut):
+    if (
+        cfg is not None
+        and cfg.channels_last
+        and not cfg.exact_channels_last
+        and type(shortcut) is AvgDown3D
+        and not fp._has_forward_hooks(shortcut)
+    ):
         out = down.avg_down3d_add(x, source, shortcut.factor_t, shortcut.factor_s, shortcut.group_size)
         if out is not None:
             return out
+    if (
+        cfg is not None
+        and cfg.exact_channels_last
+        and type(shortcut) is AvgDown3D
+        and not fp._has_forward_hooks(shortcut)
+    ):
+        gathered = down.avg_down3d_gather(source, shortcut.factor_t, shortcut.factor_s)
+        if gathered is not None:
+            # Upstream's mean over the very tensor its permute-copy produces.
+            b, _, _, _, _, t, h, w = gathered.shape
+            return x + gathered.view(b, shortcut.out_channels, shortcut.group_size, t, h, w).mean(dim=2)
     # Lossless retains ATen's reduction and its intermediate dtype rounding.
     return x + shortcut(source)
 
@@ -136,6 +167,19 @@ def encoder_forward(
         feat_idx = [0]
     if torch.is_grad_enabled() or torch.compiler.is_compiling():
         return WanEncoder3d.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx)
+    cfg = getattr(self, fp.CFG_ATTR, None)
+    exact_channels_last = cfg is not None and cfg.exact_channels_last
+    if exact_channels_last and not fp._upstream_runs_channels_first(x):
+        fp._demote_exact_channels_last(self, cfg)
+        exact_channels_last = False
+    x = _encoder_body(self, x, feat_cache, feat_idx)
+    # Lossless output keeps the channels-first layout of the reference encoder.
+    return x.contiguous() if exact_channels_last else x
+
+
+def _encoder_body(
+    self: WanEncoder3d, x: torch.Tensor, feat_cache: list[Any] | None, feat_idx: list[int]
+) -> torch.Tensor:
     if feat_cache is None:
         x = self.conv_in(x)
     else:

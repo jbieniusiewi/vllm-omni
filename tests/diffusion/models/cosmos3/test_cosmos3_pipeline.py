@@ -901,17 +901,20 @@ def test_multiview_postprocess_releases_converted_view_before_next_camera(monkey
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as pipeline_module
 
     converted_views = []
+    denormalize_view = pipeline_module._denormalize_view
 
-    class TrackingVideoProcessor(pipeline_module.VideoProcessor):
-        def postprocess(self, image, output_type="pil", **kwargs):
-            # One camera's [T, C, H, W] frames per call.
-            assert image.device.type == "cpu" and image.shape == (3, 3, 4, 4)
-            assert all(reference() is None for reference in converted_views)
-            result = super().postprocess(image, output_type=output_type, **kwargs)
-            converted_views.append(weakref.ref(result))
-            return result
+    def tracking_denormalize_view(video_processor, image):
+        # One camera's [T, C, H, W] frames per call.
+        assert image.device.type == "cpu" and image.shape == (3, 3, 4, 4)
+        assert all(reference() is None for reference in converted_views)
+        result = denormalize_view(video_processor, image)
+        bits_reference = video_processor.postprocess(image, output_type="pt")
+        assert torch.equal(result, bits_reference)
+        del bits_reference
+        converted_views.append(weakref.ref(result))
+        return result
 
-    monkeypatch.setattr(pipeline_module, "VideoProcessor", TrackingVideoProcessor)
+    monkeypatch.setattr(pipeline_module, "_denormalize_view", tracking_denormalize_view)
     postprocess = pipeline_module.get_cosmos3_multiview_post_process_func(SimpleNamespace())
     postprocess(
         {

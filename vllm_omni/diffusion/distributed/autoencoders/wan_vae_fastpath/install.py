@@ -233,16 +233,16 @@ def _install_bindings(
         fused_silu_dtypes = frozenset(
             dtype for dtype in (torch.bfloat16, torch.float16) if rn.silu_epilogue_is_exact(device, dtype)
         )
-    # The lossless decoder keeps channels-last activations where that is verified
-    # bit-exact, saving cuDNN's two layout transposes around every convolution.
+    # The lossless decoder and encoder keep channels-last activations where that is
+    # verified bit-exact, saving cuDNN's two layout transposes around every convolution.
     exact_channels_last = (
         level == "lossless"
-        and not encoder
         and _exact_channels_last_supported(device)
         # cuDNN picks layout-dependent algorithms for fp32 convolutions.
         and all(p.dtype in (torch.float16, torch.bfloat16) for p in component.parameters())
-        # Verified for the residual (Wan 2.2) decoder only; the Wan 2.1 up blocks keep channels-first.
-        and any(type(module) is WanResidualUpBlock for module in component.modules())
+        # Verified for the residual (Wan 2.2) decoder and the residual encoder (checked by its
+        # installer) only; the Wan 2.1 up blocks keep channels-first.
+        and (encoder or any(type(module) is WanResidualUpBlock for module in component.modules()))
     )
     cfg = forwards.FastPathConfig(
         fused_silu_dtypes=fused_silu_dtypes,
@@ -277,8 +277,8 @@ def _install_bindings(
             bind(module, replacement)
 
         if cfg.exact_channels_last:
-            # The decoder input keeps upstream's channels-first layout; every
-            # decoder convolution verifies its layout change per shape.
+            # The component input keeps upstream's channels-first layout; every
+            # convolution verifies its layout change per shape.
             convs = [module for module in convs if module is not getattr(vae, "post_quant_conv", None)]
             for module in convs:
                 original = {

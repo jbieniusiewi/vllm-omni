@@ -22,10 +22,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections import OrderedDict
-from collections.abc import Iterable, Mapping, Sequence
+from collections import OrderedDict, deque
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from itertools import islice
 from typing import Any, ClassVar
 
 import torch
@@ -112,6 +113,44 @@ _SYSTEM_PROMPTS = {
 }
 
 
+class _PinnedDeviceToHost:
+    """Device -> pageable host copies on a side stream, through a ring of pinned buffers.
+
+    A pageable ``Tensor.copy_`` blocks the launching thread for the whole
+    transfer. Run from a helper thread, this copy overlaps the device work the
+    caller keeps launching: each piece's DMA into one pinned buffer overlaps the
+    host memcpy out of the previous one.
+    """
+
+    def __init__(self, device: torch.device, *, piece_bytes: int = 32 << 20, depth: int = 2) -> None:
+        self.stream = torch.cuda.Stream(device)
+        self.buffers = [torch.empty(piece_bytes, dtype=torch.uint8, pin_memory=True) for _ in range(depth)]
+        self.events = [torch.cuda.Event() for _ in range(depth)]
+
+    def copy(self, dst: torch.Tensor, src: torch.Tensor, ready: torch.cuda.Event) -> None:
+        """Copy contiguous ``src`` (produced before ``ready``) into contiguous ``dst``; returns when done."""
+        src_bytes, dst_bytes = src.view(-1).view(torch.uint8), dst.view(-1).view(torch.uint8)
+        piece = self.buffers[0].numel()
+        in_flight: deque[tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]] = deque()
+        self.stream.wait_event(ready)
+        # Grad mode is thread-local: the forward's inference tensors need inference mode here too.
+        with torch.inference_mode(), torch.cuda.stream(self.stream):
+            for index, start in enumerate(range(0, src_bytes.numel(), piece)):
+                if len(in_flight) == len(self.buffers):
+                    event, staged, target = in_flight.popleft()
+                    event.synchronize()
+                    target.copy_(staged)
+                length = min(piece, src_bytes.numel() - start)
+                staged = self.buffers[index % len(self.buffers)][:length]
+                staged.copy_(src_bytes[start : start + length], non_blocking=True)
+                event = self.events[index % len(self.events)]
+                event.record(self.stream)
+                in_flight.append((event, staged, dst_bytes[start : start + length]))
+            for event, staged, target in in_flight:
+                event.synchronize()
+                target.copy_(staged)
+
+
 def get_cosmos3_nano_sim_auto_pre_process_func(od_config: OmniDiffusionConfig):
     return get_cosmos3_multiview_pre_process_func(od_config)
 
@@ -150,6 +189,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
     _transformer_cls_override: ClassVar[type[Cosmos3NanoSimAutoTransformer]] = Cosmos3NanoSimAutoTransformer
     _MAIN_BRANCH = "main"
     _TEXT_CACHE = "text"
+    #: Cameras decoded ahead of the VAE encode (~0.7 GB of normalized clip each at 480p/297f).
+    _MEDIA_PREFETCH_DEPTH: ClassVar[int] = 4
     _SESSION_CAPACITY = 1
     _ar_diffusion_kv_state = None
     _bound_session_id: str | None = None
@@ -415,7 +456,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
     def _view_value(view: Mapping[str, Any], field: str) -> Any:
         return view.get(f"{field}_path", view.get(field))
 
-    def _encode_camera_major(
+    @contextmanager
+    def _prefetched_camera_media(
         self,
         views: Sequence[Mapping[str, Any]],
         *,
@@ -423,11 +465,12 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         height: int,
         width: int,
         num_frames: int,
-    ) -> torch.Tensor:
-        """Encode one media field of every camera independently: ``[1, C, V*T_lat, h, w]``.
+    ) -> Iterator[Iterator[torch.Tensor]]:
+        """Yield one media field of every camera, normalized, in camera order.
 
-        The host-side decode/resize/normalize of the next camera runs on a helper
-        thread while the current camera is VAE-encoded on the device.
+        The host-side decode/resize/normalize runs on a helper thread up to
+        ``_MEDIA_PREFETCH_DEPTH`` cameras ahead and starts on entry, so device
+        work issued before the clips are consumed hides it as well.
         """
 
         def load(view: Mapping[str, Any]) -> torch.Tensor:
@@ -438,17 +481,30 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
             frames = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
             return uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)
 
-        latents = []
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cosmos3-sim-auto-media") as loader:
             upcoming = iter(views)
-            following = next(upcoming, None)
-            pending = None if following is None else loader.submit(load, following)
-            while pending is not None:
-                video = pending.result()
-                following = next(upcoming, None)
-                pending = None if following is None else loader.submit(load, following)
-                latents.append(self._encode_video_tensor(video))
-                del video
+            pending = deque(loader.submit(load, view) for view in islice(upcoming, self._MEDIA_PREFETCH_DEPTH))
+
+            def clips() -> Iterator[torch.Tensor]:
+                while pending:
+                    video = pending.popleft().result()
+                    following = next(upcoming, None)
+                    if following is not None:
+                        pending.append(loader.submit(load, following))
+                    yield video
+
+            try:
+                yield clips()
+            finally:
+                for future in pending:
+                    future.cancel()
+
+    def _encode_camera_major(self, clips: Iterable[torch.Tensor]) -> torch.Tensor:
+        """VAE-encode every camera's clip independently: ``[1, C, V*T_lat, h, w]``."""
+        latents = []
+        for video in clips:
+            latents.append(self._encode_video_tensor(video))
+            del video
         lengths = {int(latent.shape[2]) for latent in latents}
         if len(lengths) != 1:
             raise ValueError(f"Per-camera VAE encodes have unequal latent lengths: {lengths}.")
@@ -710,7 +766,23 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                     f"pool chunk={spec.chunk_size}, block={bound.kv_cache.block_size}, request frame unit={frame_unit}."
                 )
 
-        control = self._encode_camera_major(views, field="control", height=height, width=width, num_frames=num_frames)
+        # Camera decode is host-bound and the LiDAR encode device-only: start the
+        # camera loads first so they proceed behind the LiDAR encode.
+        with self._prefetched_camera_media(
+            views, field="control", height=height, width=width, num_frames=num_frames
+        ) as control_clips:
+            lidar_control = lidar_target = None
+            lidar_condition_sweeps: frozenset[int] = frozenset()
+            if joint:
+                assert self.lidar_encoder is not None and lidar_request is not None and sweeps is not None
+                frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
+                lidar_control = self.lidar_encoder(frames).to(device=self.device, dtype=self.sampling_dtype)
+                del frames
+                lidar_target = torch.zeros_like(lidar_control)
+                if lidar_condition:
+                    lidar_target[:, :, :1] = self._encode_lidar_condition(lidar_request, num_sweeps=sweeps)
+                    lidar_condition_sweeps = frozenset({0})
+            control = self._encode_camera_major(control_clips)
         if control.shape[2] != num_views * latents_per_view:
             raise RuntimeError(
                 f"WSM control latents hold {control.shape[2]} frames, expected {num_views * latents_per_view}."
@@ -723,18 +795,6 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 target.dtype
             )
             condition_frames = frozenset({0})
-
-        lidar_control = lidar_target = None
-        lidar_condition_sweeps: frozenset[int] = frozenset()
-        if joint:
-            assert self.lidar_encoder is not None and lidar_request is not None and sweeps is not None
-            frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
-            lidar_control = self.lidar_encoder(frames).to(device=self.device, dtype=self.sampling_dtype)
-            del frames
-            lidar_target = torch.zeros_like(lidar_control)
-            if lidar_condition:
-                lidar_target[:, :, :1] = self._encode_lidar_condition(lidar_request, num_sweeps=sweeps)
-                lidar_condition_sweeps = frozenset({0})
 
         # Captions: one causal UND pass per camera (positions rewound to zero); the
         # sink document is the caption's own first tokens, so its K/V are a prefix slice.
@@ -1172,26 +1232,49 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         assert state.rgb_target_latents is not None
         num_views = state.num_views
         frames_per_view = state.rgb_target_latents.shape[2] // num_views
-        decoded = None
-        for view in range(num_views):
-            clip = self._decode_latents(
-                state.rgb_target_latents.narrow(2, view * frames_per_view, frames_per_view)
-            ).clamp_(-1, 1)
-            if decoded is None:
-                decoded = torch.empty(
-                    (clip.shape[0], clip.shape[1], num_views * clip.shape[2], *clip.shape[3:]),
-                    dtype=clip.dtype,
-                    device="cpu",
-                )
-            decoded.narrow(2, view * clip.shape[2], clip.shape[2]).copy_(clip)
-            del clip
-        assert decoded is not None
-        payload: dict[str, Any] = {"video": decoded}
-        if return_latents:
-            # Preserve sampling dtype and camera-major layout for reference comparisons.
-            payload["latents"] = {"vision_latent": state.rgb_target_latents.detach().cpu().contiguous()}
-            if state.lidar_target_latents is not None:
-                payload["latents"]["lidar_latent"] = state.lidar_target_latents.detach().cpu().contiguous()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cosmos3-sim-auto-d2h") as copier:
+            # Each view's host copy runs behind the next view's decode (and the
+            # last one behind the LiDAR decode); every copy finishes before return.
+            to_host = (
+                _PinnedDeviceToHost(state.rgb_target_latents.device) if state.rgb_target_latents.is_cuda else None
+            )
+            copies = []
+            decoded = None
+            for view in range(num_views):
+                clip = self._decode_latents(
+                    state.rgb_target_latents.narrow(2, view * frames_per_view, frames_per_view)
+                ).clamp_(-1, 1)
+                if decoded is None:
+                    decoded = torch.empty(
+                        (clip.shape[0], clip.shape[1], num_views * clip.shape[2], *clip.shape[3:]),
+                        dtype=clip.dtype,
+                        device="cpu",
+                    )
+                target = decoded.narrow(2, view * clip.shape[2], clip.shape[2])
+                if to_host is None or not clip.is_contiguous():
+                    target.copy_(clip)
+                else:
+                    ready = torch.cuda.Event()
+                    ready.record()
+                    # ``target[b, c]`` is one contiguous run of the camera-major host tensor.
+                    copies.extend(
+                        copier.submit(to_host.copy, target[b, c], clip[b, c], ready)
+                        for b in range(clip.shape[0])
+                        for c in range(clip.shape[1])
+                    )
+                del clip
+            assert decoded is not None
+            payload: dict[str, Any] = {"video": decoded}
+            if return_latents:
+                # Preserve sampling dtype and camera-major layout for reference comparisons.
+                payload["latents"] = {"vision_latent": state.rgb_target_latents.detach().cpu().contiguous()}
+                if state.lidar_target_latents is not None:
+                    payload["latents"]["lidar_latent"] = state.lidar_target_latents.detach().cpu().contiguous()
+            if state.joint and lidar_request is not None and as_bool(lidar_request.get("return_output"), False):
+                assert self.lidar_decoder is not None and state.lidar_target_latents is not None
+                payload["lidar"] = self.lidar_decoder(state.lidar_target_latents)
+            for pending in copies:
+                pending.result()
         metadata: dict[str, Any] = {
             "multiview": {
                 "cameras": list(state.cameras),
@@ -1209,10 +1292,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                 "checkpoint_id": self.manifest.checkpoint_id,
             },
         }
-        if state.joint and lidar_request is not None and as_bool(lidar_request.get("return_output"), False):
-            assert self.lidar_decoder is not None and state.lidar_target_latents is not None
-            lidar_output = self.lidar_decoder(state.lidar_target_latents)
-            payload["lidar"] = lidar_output
+        if (lidar_output := payload.get("lidar")) is not None:
+            assert self.lidar_decoder is not None
             config = self.lidar_decoder.config
             metadata["lidar"] = {
                 "fps": config["fps"],

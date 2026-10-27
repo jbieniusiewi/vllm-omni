@@ -333,6 +333,18 @@ def get_cosmos3_multiview_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
+def _denormalize_view(video_processor: VideoProcessor, frames: torch.Tensor) -> torch.Tensor:
+    """``video_processor.postprocess(frames, output_type="pt")`` for one camera's ``[T, C, H, W]`` frames.
+
+    ``VaeImageProcessor.denormalize`` is ``(x * 0.5 + 0.5).clamp(0, 1)``; running
+    it in place after the first op keeps its roundings without two clip-sized
+    temporaries.
+    """
+    if not video_processor.config.do_normalize:
+        return frames
+    return frames.mul(0.5).add_(0.5).clamp_(0, 1)
+
+
 def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
     """Process camera-major video one view at a time and preserve numeric LiDAR."""
     from .guardrails import check_video_safety, is_guardrails_enabled
@@ -385,7 +397,7 @@ def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
                 # postprocess_video's arithmetic (denormalize in the decoder dtype,
                 # then FP32 HWC for "np"), written straight into the output slice
                 # instead of through per-view stacked NumPy copies.
-                processed_view = video_processor.postprocess(view[0].permute(1, 0, 2, 3), output_type="pt")
+                processed_view = _denormalize_view(video_processor, view[0].permute(1, 0, 2, 3))
                 if output_type == "np":
                     processed_view = processed_view.permute(0, 2, 3, 1)
                 if processed_video is None:

@@ -310,43 +310,19 @@ def _matches_aten(x: torch.Tensor, x_rows, gamma, bias, out_rows, scale, config)
     return bool(torch.equal(denom.view(torch.int32), reference.view(torch.int32)))
 
 
-def rms_norm_channels_last_exact(
+def _exact_config(
     x: torch.Tensor,
+    x_rows: torch.Tensor,
     gamma: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_rows: torch.Tensor,
     scale: float,
-    *,
-    silu: bool = False,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    """Lossless ``WanRMS_norm(x + bias)`` [then SiLU] of a channels-last ``x``, in its layout, or ``None``.
-
-    Bit-identical to the channels-first lossless path. ``bias`` is the un-added
-    per-channel bias of the convolution that produced ``x``. Callers must only
-    request ``silu`` for dtypes whose fused SiLU epilogue was verified exact.
-    """
-    if not HAS_TRITON or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES or x.numel() == 0:
-        return None
-    channels = x.shape[1]
-    if channels < 2 or channels > _MAX_CHANNELS:
-        return None
-    if gamma.numel() != channels or gamma.dtype is not x.dtype or gamma.device != x.device:
-        return None
-    if bias is not None and (bias.dim() != 1 or bias.numel() != channels or bias.dtype is not x.dtype):
-        return None
-    x_rows = _rows_view(x)
-    if x_rows is None:
-        return None
-    rows = x_rows.shape[0]
+) -> tuple[int, int] | None:
+    """The reduction config for ``x``, once its denominators were verified against ATen; else ``None``."""
+    rows, channels = x_rows.shape
     config = aten_norm_reduce_config(channels, rows, x.device)
     if config[0] not in _SUPPORTED_BLOCK_HEIGHTS or config[1] > _MAX_CTAS_PER_OUTPUT * config[0]:
         return None
-    out = torch.empty_like(x)
-    out_rows = _rows_view(out)
-    if out_rows is None:
-        return None
-    gamma = gamma.reshape(-1).contiguous()
-    bias = None if bias is None else bias.contiguous()
-
     key = (channels, rows, x.dtype, bias is not None, x.device)
     verdict = _VERDICTS.get(key)
     if verdict is None:
@@ -361,10 +337,117 @@ def rms_norm_channels_last_exact(
                 channels,
                 rows,
             )
-    if not verdict:
+    return config if verdict else None
+
+
+def _supported(x: torch.Tensor, gamma: torch.Tensor, bias: torch.Tensor | None) -> bool:
+    if not HAS_TRITON or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES or x.numel() == 0:
+        return False
+    channels = x.shape[1]
+    if channels < 2 or channels > _MAX_CHANNELS:
+        return False
+    if gamma.numel() != channels or gamma.dtype is not x.dtype or gamma.device != x.device:
+        return False
+    return bias is None or (bias.dim() == 1 and bias.numel() == channels and bias.dtype is x.dtype)
+
+
+def rms_norm_channels_last_exact(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: float,
+    *,
+    silu: bool = False,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Lossless ``WanRMS_norm(x + bias)`` [then SiLU] of a channels-last ``x``, in its layout, or ``None``.
+
+    Bit-identical to the channels-first lossless path. ``bias`` is the un-added
+    per-channel bias of the convolution that produced ``x``. Callers must only
+    request ``silu`` for dtypes whose fused SiLU epilogue was verified exact.
+    """
+    if not _supported(x, gamma, bias):
+        return None
+    x_rows = _rows_view(x)
+    if x_rows is None:
+        return None
+    out = torch.empty_like(x)
+    out_rows = _rows_view(out)
+    if out_rows is None:
+        return None
+    gamma = gamma.reshape(-1).contiguous()
+    bias = None if bias is None else bias.contiguous()
+    config = _exact_config(x, x_rows, gamma, bias, out_rows, scale)
+    if config is None:
         return None
     _launch(x_rows, gamma, bias, out_rows, None, scale, config, silu=silu)
     return out
 
 
-__all__ = ["aten_norm_reduce_config", "rms_norm_channels_last_exact"]
+def norm_act_cat_time_exact(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    scale: float,
+    cache: torch.Tensor | None,
+    pad_front: int,
+    *,
+    silu: bool,
+    bias: torch.Tensor | None = None,
+    keep_cache_frames: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``[zeros | cache | rms_norm_channels_last_exact(x)]`` along time and its last frames, or ``None``.
+
+    The channels-last counterpart of the lossless encoder's fused norm/assembly
+    (:func:`..triton_norm_cache.norm_act_cat_time`): the normalized rows are
+    written straight into the time-assembled convolution input, so no
+    normalized temporary is materialized. Values are those of
+    :func:`rms_norm_channels_last_exact`; only whole channels-last frames move
+    otherwise. Requires a single-batch channels-last ``x`` and history.
+    """
+    if x.dim() != 5 or x.shape[0] != 1 or pad_front < 0 or keep_cache_frames < 1 or not _supported(x, gamma, bias):
+        return None
+    _, channels, frames, height, width = x.shape
+    cache_frames = 0
+    if cache is not None:
+        if (
+            cache.dim() != 5
+            or cache.shape[:2] != x.shape[:2]
+            or cache.shape[3:] != x.shape[3:]
+            or cache.dtype != x.dtype
+            or cache.device != x.device
+            or not cache.is_contiguous(memory_format=torch.channels_last_3d)
+        ):
+            return None
+        cache_frames = cache.shape[2]
+    if cache_frames > pad_front:
+        return None
+    x_rows = _rows_view(x)
+    if x_rows is None:
+        return None
+    out_frames = pad_front + frames
+    out = torch.empty(
+        (1, channels, out_frames, height, width),
+        dtype=x.dtype,
+        device=x.device,
+        memory_format=torch.channels_last_3d,
+    )
+    out_rows = _rows_view(out)
+    if out_rows is None:
+        return None
+    # Frame-major rows: the normalized frames follow the front frames contiguously.
+    norm_rows = out_rows[pad_front * height * width :]
+    gamma = gamma.reshape(-1).contiguous()
+    bias = None if bias is None else bias.contiguous()
+    config = _exact_config(x, x_rows, gamma, bias, norm_rows, scale)
+    if config is None:
+        return None
+    _launch(x_rows, gamma, bias, norm_rows, None, scale, config, silu=silu)
+    zero_frames = pad_front - cache_frames
+    if zero_frames:
+        out[:, :, :zero_frames].zero_()
+    if cache_frames:
+        out[:, :, zero_frames:pad_front].copy_(cache)
+    keep = out[:, :, out_frames - min(keep_cache_frames, out_frames) :].clone(memory_format=torch.channels_last_3d)
+    return out, keep
+
+
+__all__ = ["aten_norm_reduce_config", "norm_act_cat_time_exact", "rms_norm_channels_last_exact"]
